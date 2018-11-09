@@ -954,10 +954,12 @@ class Engine(object):
         self_prefix = self.network.get_absolute_name_scope_prefix()  # "" if root, otherwise with "/" at end
         load_if_prefix = opts.get('prefix', '')  # prefix to identify the variables to be restored from the file
         from TFNetwork import CustomCheckpointLoader
+        ignore_missing = opts.get("ignore_missing", False)
         loader = CustomCheckpointLoader(
-          filename=model_filename, saveable_params=self.network.get_trainable_params(),
+          filename=model_filename,
+          saveable_params=self.network.get_params_list() if ignore_missing else self.network.get_trainable_params(),
           params_prefix=self_prefix, load_if_prefix=load_if_prefix,
-          ignore_missing=opts.get("ignore_missing", False))
+          ignore_missing=ignore_missing)
         loader.set_as_custom_init()
       self.network.initialize_params(session=self.tf_session)
 
