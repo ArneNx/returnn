@@ -1,6 +1,8 @@
 
 from __future__ import print_function
 
+import pprint
+
 import tensorflow as tf
 import sys
 import numpy
@@ -361,6 +363,36 @@ class TFNetwork(object):
       # However, any dependencies might resolve to the main net.
       self.extra_net.construct_layer(net_dict=net_dict, name=layer_name, check_existing=False)
 
+  def get_layer_names(self, net_dict: dict):
+    """
+    This function generates a set of layer names that are present in the given dictionary.
+    For e.g. recurrent units (i.e. hierarchical structures) in the dictionary the function additonally
+     generates the corresponding path (e.g. "output/unit/my_sub_layer") and adds it to the set.
+
+    :param dict[str,dict[str]] net_dict: network dictionary for which the names are to be generated
+    :rtype: set[str]
+    """
+    names = set()
+    for name, sub_dict in net_dict.items():
+      if isinstance(sub_dict, dict):
+        sub_names = self.get_layer_names(sub_dict)
+        for n in sub_names:
+          names.add(name + "/" + n)  # add hierarchical name (for layers from outside)
+      names.add(name)
+    return names
+
+  def get_layer_for_path(self, root_layer: LayerBase, path: list):
+    """
+    This function resolves the given path recursively and returns the corresponding layer.
+
+    :param LayerBase root_layer: layer the path is relative to
+    :param list[str] path: remaining path to be resolved
+    :return: LayerBase
+    """
+    if not path:
+      return root_layer
+    return self.get_layer_for_path(root_layer.layers[path[0]], path[1:] if len(path) > 1 else None)
+
   def construct_layer(self, net_dict, name, get_layer=None, add_layer=None, check_existing=True):
     """
     :param dict[str,dict[str]] net_dict:
@@ -373,6 +405,7 @@ class TFNetwork(object):
     :param bool check_existing: check self.get_layer. (self.layers will be checked in any case)
     :rtype: LayerBase
     """
+    layer_path = None
     if name in self.layers:
       return self.layers[name]
     if check_existing:
@@ -383,15 +416,21 @@ class TFNetwork(object):
     if name in self._constructing_layers:
       raise NetworkConstructionDependencyLoopException(
         layer_name=name, constructing_layers=self._constructing_layers, net_dict=net_dict, network=self)
-    if name not in net_dict:
+    if name not in self.get_layer_names(net_dict):
       if name == "data":
         layer_desc = {"class": "source", "from": []}
       elif name.startswith("data:"):
         layer_desc = {"class": "source", "data_key": name[len("data:"):], "from": []}
       else:
+        pp = pprint.PrettyPrinter(indent=4)
+        # pp.pprint(net_dict)
+        # print(name in net_dict)
         raise LayerNotFound("layer %r not found in %r" % (name, self))
     else:
-      layer_desc = net_dict[name]
+      # first resolve the root layer of a given path
+      # the rest is going to be resolved implicitlty due to the hierarchical structure
+      layer_desc = net_dict[name.split('/')[0]]  # get the root layer's name
+      layer_path = name.split('/')[1:] if '/' in name else None  # save the rest of the path to look up the layer later
     if not get_layer:
       def get_layer(src_name):
         return self.construct_layer(net_dict=net_dict, name=src_name)
@@ -407,7 +446,7 @@ class TFNetwork(object):
       layer_class.transform_config_dict(layer_desc, network=self, get_layer=get_layer)
     finally:
       self._constructing_layers.remove(name)
-    return add_layer(name=name, layer_class=layer_class, **layer_desc)
+    return self.get_layer_for_path(add_layer(name=name, layer_class=layer_class, **layer_desc), layer_path)
 
   def _create_layer_layer_desc(self, name, layer_desc):
     """

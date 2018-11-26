@@ -220,13 +220,15 @@ class RecLayer(_ConcatInputLayer):
   @classmethod
   def transform_config_dict(cls, d, network, get_layer):
     """
+    This method transforms the templates in the config dictionary into references
+    of the layer instances (and creates them in the process).
     :param dict[str] d: will modify inplace
     :param TFNetwork.TFNetwork network:
     :param ((str) -> LayerBase) get_layer: function to get or construct another layer
     """
     if isinstance(d.get("unit"), dict):
       d["n_out"] = d.get("n_out", None)  # disable automatic guessing
-    super(RecLayer, cls).transform_config_dict(d, network=network, get_layer=get_layer)
+    super(RecLayer, cls).transform_config_dict(d, network=network, get_layer=get_layer)  # everything except "unit"
     if "initial_state" in d:
       d["initial_state"] = RnnCellLayer.transform_initial_state(
         d["initial_state"], network=network, get_layer=get_layer)
@@ -234,7 +236,7 @@ class RecLayer(_ConcatInputLayer):
       def sub_get_layer(name):
         # Only used to resolve deps to base network.
         if name.startswith("base:"):
-          return get_layer(name[len("base:"):])
+          return get_layer(name[len("base:"):])  # calls get_layer of parent network
       from TFNetwork import TFNetwork, ExternData
       subnet = TFNetwork(parent_net=network, extern_data=network.extern_data)  # dummy subnet
       for sub in d["unit"].values():  # iterate over the layers of the subnet
