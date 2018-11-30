@@ -722,6 +722,15 @@ class RecLayer(_ConcatInputLayer):
       return layer.is_prev_time_frame
     return False
 
+  def get_sub_layer(self, layer_name: str):
+    """
+    :param layer_name:  The sub_layer addressed by '/' separated path.
+    :return: The sub_layer addressed in layer_name or None if no sub_layer exists
+    """
+    if '/' in layer_name and layer_name.split('/')[0] == 'unit':
+      return self.cell.get_sub_layer('/'.join(layer_name.split('/')[1:]))
+    return None
+
 
 class _SubnetworkRecCell(object):
   """
@@ -1063,6 +1072,19 @@ class _SubnetworkRecCell(object):
         continue
       get_layer(layer_name)
       assert layer_name in self.net.layers
+
+  def get_sub_layer(self, layer_name: str):
+    """
+    :param layer_name:  The sub_layer addressed by '/' separated path.
+    :return: The sub_layer addressed in layer_name or None if no sub_layer exists
+    """
+    if layer_name in self.output_layers_net.layers:
+      return self.output_layers_net.layers[layer_name]
+    elif layer_name in self.input_layers_net.layers:
+      return self.input_layers_net.layers[layer_name]
+    elif layer_name in self.net.layers:
+      return self.net.layers[layer_name]
+    return None
 
   def _get_init_output(self, name):
     """
@@ -2135,7 +2157,7 @@ class _SubnetworkRecCell(object):
       if name.startswith("prev:"):
         return get_prev_layer(name[len("prev:"):])
       if name.startswith("base:"):
-        return self.parent_net.layers[name[len("base:"):]]
+        return self.parent_net.get_layer(name[len("base:"):])
       if name in self.input_layers_moved_out:
         return self.input_layers_net.layers[name]
       if name in self.output_layers_moved_out or name.startswith("data:"):
