@@ -476,10 +476,12 @@ class LayerBase(object):
     """
     return list(self.sources) + list(self.collocate_with)
 
-  def get_sub_layer(self, layer_name: str):
+  def get_sub_layer(self, layer_name):
     """
-    :param layer_name:  The sub_layer addressed by '/' separated path.
+    The default behavior for any layer is to return None.
+    :param str layer_name:  The sub_layer addressed by '/' separated path.
     :return: The sub_layer addressed in layer_name or None if no sub_layer exists
+    :rtype: LayerBase|None
     """
     return None
 

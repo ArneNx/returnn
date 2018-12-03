@@ -722,12 +722,15 @@ class RecLayer(_ConcatInputLayer):
       return layer.is_prev_time_frame
     return False
 
-  def get_sub_layer(self, layer_name: str):
+  def get_sub_layer(self, layer_name):
     """
-    :param layer_name:  The sub_layer addressed by '/' separated path.
+    :param str layer_name:  The sub_layer addressed by '/' separated path.
     :return: The sub_layer addressed in layer_name or None if no sub_layer exists
+    :rtype: LayerBase|None
     """
-    if '/' in layer_name and layer_name.split('/')[0] == 'unit':
+    if '/' in layer_name and isinstance(self.cell, _SubnetworkRecCell):
+      # next element in path is something like "unit/sub_layer"
+      # try to find "sub_layer" in cell:
       return self.cell.get_sub_layer('/'.join(layer_name.split('/')[1:]))
     return None
 
@@ -1073,16 +1076,17 @@ class _SubnetworkRecCell(object):
       get_layer(layer_name)
       assert layer_name in self.net.layers
 
-  def get_sub_layer(self, layer_name: str):
+  def get_sub_layer(self, layer_name):
     """
-    :param layer_name:  The sub_layer addressed by '/' separated path.
+    :param str layer_name:  The sub_layer addressed by '/' separated path.
     :return: The sub_layer addressed in layer_name or None if no sub_layer exists
+    :rtype: LayerBase|None
     """
-    if layer_name in self.output_layers_net.layers:
+    if self.output_layers_net and layer_name in self.output_layers_net.layers:
       return self.output_layers_net.layers[layer_name]
-    elif layer_name in self.input_layers_net.layers:
+    elif self.input_layers_net and layer_name in self.input_layers_net.layers:
       return self.input_layers_net.layers[layer_name]
-    elif layer_name in self.net.layers:
+    elif self.net and layer_name in self.net.layers:
       return self.net.layers[layer_name]
     return None
 

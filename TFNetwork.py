@@ -1,8 +1,6 @@
 
 from __future__ import print_function
 
-import pprint
-
 import tensorflow as tf
 import sys
 import numpy
