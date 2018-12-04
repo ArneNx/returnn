@@ -388,6 +388,12 @@ class TFNetwork(object):
         layer_desc = {"class": "source", "from": []}
       elif name.startswith("data:"):
         layer_desc = {"class": "source", "data_key": name[len("data:"):], "from": []}
+      elif '/' in name:
+        # it may be a hierarchical path to a sub-layer, which should have been found by get_layer()
+        # but maybe it's not constructed yet, so try constructing the root layer
+        self.construct_layer(net_dict, name.split('/')[0], get_layer, add_layer, check_existing)
+        # constructing the root layer should have constructed all its children
+        return self.get_layer(name)  # ...so try again now
       else:
         raise LayerNotFound("layer %r not found in %r" % (name, self))
     else:
@@ -684,6 +690,7 @@ class TFNetwork(object):
     :param str layer_name:
     :rtype: LayerBase
     """
+
     if layer_name in self.layers:
       return self.layers[layer_name]
     if layer_name.startswith("extra:") or layer_name.startswith("extra_search:"):
@@ -696,6 +703,12 @@ class TFNetwork(object):
       if not self.parent_net:
         raise LayerNotFound("cannot get layer %r, no parent net for %r" % (layer_name, self))
       return self.parent_net.get_layer(layer_name[len("base:"):])
+    if '/' in layer_name:
+      # this is probably a path to a sub-layer
+      root_layer = self.get_layer(layer_name.split('/')[0])  # get the root-layer (first part of the path)
+      sub_layer = root_layer.get_sub_layer('/'.join(layer_name.split('/')[1:]))  # get the sub-layer from the root-layer
+      if sub_layer:  # get_sub_layer returns None by default (if sub-layer not found)
+        return sub_layer
     if layer_name not in self.layers:
       raise LayerNotFound("layer %r not found in %r" % (layer_name, self))
     return self.layers[layer_name]

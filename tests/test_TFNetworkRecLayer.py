@@ -1429,7 +1429,6 @@ def test_rec_layer_move_out_of_loop():
   assert not train_not_optim_out_layer.cell.output_layers_moved_out
   train(train_not_optim_net)
 
-
 def test_rec_layer_search_select_src():
   from TFNetworkRecLayer import _SubnetworkRecCell
   n_src_dim = 5
