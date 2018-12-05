@@ -84,7 +84,9 @@ class MetaDataset(CachedDataset2):
                seq_lens_file=None,
                data_dims=None,
                data_dtypes=None,
-               window=1, **kwargs):
+               window=1,
+               blind_mode=False,
+               **kwargs):
     """
     :param dict[str,dict[str]] datasets: dataset-key -> dataset-kwargs. including keyword 'class' and maybe 'files'
     :param dict[str,(str,str)] data_map: self-data-key -> (dataset-key, dataset-data-key).
@@ -107,13 +109,16 @@ class MetaDataset(CachedDataset2):
     assert "data" in self.data_keys
     self.target_list = sorted(self.data_keys - {"data"})
     self.default_dataset_key = self.data_map["data"][0]
+    self.blind_mode = blind_mode
+    self.seq_idx_offsets = {key: 0 for key in self.dataset_keys}
 
     # This will only initialize datasets needed for features occuring in data_map
     self.datasets = {
       key: init_dataset(datasets[key], extra_kwargs={"name": "%s_%s" % (self.name, key)})
       for key in self.dataset_keys}
 
-    self.seq_list_original = self._load_seq_list(seq_list_file) # type: dict[str,list[str]]  # dataset key -> seq list
+    if not blind_mode:
+      self.seq_list_original = self._load_seq_list(seq_list_file) # type: dict[str,list[str]]  # dataset key -> seq list
 
     if seq_lens_file:
       seq_lens = load_json(filename=seq_lens_file)
@@ -193,28 +198,41 @@ class MetaDataset(CachedDataset2):
     super(MetaDataset, self).init_seq_order(epoch=epoch, seq_list=seq_list)
 
     if not need_reinit:
-      self._num_seqs = len(self.seq_list_ordered[self.default_dataset_key])
+      if self.blind_mode:
+        self._num_seqs = min(ds.num_seqs for ds in self.datasets.values())
+      else:
+        self._num_seqs = len(self.seq_list_ordered[self.default_dataset_key])
       return False
 
-    if seq_list:
-      seq_index = [self.tag_idx[tag] for tag in seq_list]
+    if self.blind_mode:
+      for dataset_key, dataset in self.datasets.items():
+        # sort every sub-dataset on its own
+        # -> this will prevent seq-A-1 to end up with seq-B-1 all the time if 'random' or 'laplace' is selected
+        if self.seq_idx_offsets[dataset_key] == 0:  # only if offset was just reset (i.e. after a finished epoch)
+          dataset.init_seq_order(epoch=epoch, seq_list=None)
+      self._num_seqs = min(ds.num_seqs for ds in self.datasets.values())
     else:
-      if self._seq_lens:
-        get_seq_len = lambda s: self._seq_lens[self.seq_list_original[self.default_dataset_key][s]]["data"]
+      if seq_list:
+        seq_index = [self.tag_idx[tag] for tag in seq_list]
       else:
-        self.orig_seq_order_is_initialized = False
-        get_seq_len = self._get_dataset_seq_length
-      seq_index = self.get_seq_order_for_epoch(epoch, self.total_seqs, get_seq_len)
-    self._num_seqs = len(seq_index)
-    self.seq_list_ordered = {key: [ls[s] for s in seq_index] for (key, ls) in self.seq_list_original.items()}
+        if self._seq_lens:
+          get_seq_len = lambda s: self._seq_lens[self.seq_list_original[self.default_dataset_key][s]]["data"]
+        else:
+          self.orig_seq_order_is_initialized = False
+          get_seq_len = self._get_dataset_seq_length
+        seq_index = self.get_seq_order_for_epoch(epoch, self.total_seqs, get_seq_len)
+      self._num_seqs = len(seq_index)
+      self.seq_list_ordered = {key: [ls[s] for s in seq_index] for (key, ls) in self.seq_list_original.items()}
 
-    for dataset_key, dataset in self.datasets.items():
-      dataset.init_seq_order(epoch=epoch, seq_list=self.seq_list_ordered[dataset_key])
+      for dataset_key, dataset in self.datasets.items():
+        dataset.init_seq_order(epoch=epoch, seq_list=self.seq_list_ordered[dataset_key])
     return True
 
   def _load_seqs(self, start, end):
     for dataset_key in self.dataset_keys:
       self.datasets[dataset_key].load_seqs(start, end)
+      if self.blind_mode:
+        continue  # we don't have a coordinated order in self.ordered_seq_list
       for seq_idx in range(start, end):
         self._check_dataset_seq(dataset_key, seq_idx)
     super(MetaDataset, self)._load_seqs(start=start, end=end)
@@ -244,7 +262,9 @@ class MetaDataset(CachedDataset2):
     :type seq_idx: int
     :rtype: DatasetSeq
     """
-    seq_tag = self.seq_list_ordered[self.default_dataset_key][seq_idx]
+    seq_tag = None
+    if not self.blind_mode:
+      seq_tag = self.seq_list_ordered[self.default_dataset_key][seq_idx]
     features = self._get_data(seq_idx, "data")
     targets = {target: self._get_data(seq_idx, target) for target in self.target_list}
     return DatasetSeq(seq_idx=seq_idx, seq_tag=seq_tag, features=features, targets=targets)
@@ -255,10 +275,15 @@ class MetaDataset(CachedDataset2):
     return super(MetaDataset, self).get_seq_length(sorted_seq_idx)
 
   def get_partial_tag(self, dataset_key, sorted_seq_idx):
+    if self.blind_mode:
+      return "seq-%i" % sorted_seq_idx
     return self.seq_list_ordered[dataset_key][sorted_seq_idx]
 
   def get_tag(self, sorted_seq_idx):
-    partial_tags = [ self.seq_list_ordered[dataset_key][sorted_seq_idx] for dataset_key in self.dataset_keys ]
+    if self.blind_mode:
+      partial_tags = ["seq-%i" % sorted_seq_idx for _ in self.dataset_keys]
+    else:
+      partial_tags = [ self.seq_list_ordered[dataset_key][sorted_seq_idx] for dataset_key in self.dataset_keys ]
     return "<->".join(t for t in partial_tags)
 
   def get_target_list(self):

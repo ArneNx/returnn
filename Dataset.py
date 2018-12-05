@@ -241,6 +241,20 @@ class Dataset(object):
     """
     raise NotImplementedError
 
+  def init_seq_order(self, epoch=None, seq_list=None):
+    """
+    :type epoch: int|None
+    :param list[str] | None seq_list: In case we want to set a predefined order.
+    :rtype: bool
+    :returns whether the order changed (True is always safe to return)
+
+    This is called when we start a new epoch, or at initialization.
+    Call this when you reset the seq list.
+    """
+    self.epoch = epoch
+    self.rnd_seq_drop = Random(epoch or 1)
+    return False
+
   def get_seq_order_for_epoch(self, epoch, num_seqs, get_seq_len=None):
     """
     Returns the order of the given epoch.
@@ -285,14 +299,15 @@ class Dataset(object):
         nth = int(tmp[1])
       rnd_seed = ((full_epoch - 1) // nth + 1) if full_epoch else 1
       rnd = Random(rnd_seed)
-      rnd.shuffle(seq_index)
+      rnd.shuffle(seq_index)  # shuffle everything
       out_index = []
       for i in range(bins):
+        # split data into (approximately) equal-width bins:
         if i == bins - 1:
           part = seq_index[i * len(seq_index) // bins:][:]
         else:
           part = seq_index[i * len(seq_index) // bins:(i + 1) * len(seq_index) // bins][:]
-        part.sort(key=get_seq_len, reverse=(i % 2 == 1))
+        part.sort(key=get_seq_len, reverse=(i % 2 == 1))  # sort bin by seq_len
         out_index += part
       seq_index = out_index
     elif self.seq_ordering.startswith('random'):
@@ -315,20 +330,6 @@ class Dataset(object):
       seq_index = seq_index[partitions[current_partition]:partitions[current_partition + 1]]
       assert len(seq_index) == partition_sizes[current_partition]
     return seq_index
-
-  def init_seq_order(self, epoch=None, seq_list=None):
-    """
-    :type epoch: int|None
-    :param list[str] | None seq_list: In case we want to set a predefined order.
-    :rtype: bool
-    :returns whether the order changed (True is always safe to return)
-
-    This is called when we start a new epoch, or at initialization.
-    Call this when you reset the seq list.
-    """
-    self.epoch = epoch
-    self.rnd_seq_drop = Random(epoch or 1)
-    return False
 
   def _base_init(self):
     self.nbytes = 0
