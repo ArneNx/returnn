@@ -3812,6 +3812,7 @@ class DotLayer(LayerBase):
     # See __init__.
     a_out = sources[0].output.copy_as_batch_major()
     b_out = sources[1].output.copy_as_batch_major()
+    assert not a_out.beam_size or not b_out.beam_size or a_out.beam_size == b_out.beam_size
     a_reduce_axes = a_out.get_axes_from_description(red1)
     b_reduce_axes = b_out.get_axes_from_description(red2)
     assert a_reduce_axes and b_reduce_axes
@@ -3839,7 +3840,8 @@ class DotLayer(LayerBase):
       shape=tuple(a_rem_dims[1:] + a_var_dims + b_var_dims),
       batch_dim_axis=0,
       time_dim_axis=time_dim_axis,
-      dtype=a_out.dtype)
+      dtype=a_out.dtype,
+      beam_size=a_out.beam_size or b_out.beam_size)
 
 
 class ShiftAxisLayer(_ConcatInputLayer):
@@ -5258,7 +5260,7 @@ class Loss(object):
       reduce_func = tf.reduce_mean if normalize else tf.reduce_sum
       loss = reduce_func(loss, axis=list(range(1, loss.get_shape().ndims)))  # reduce remaining dims already
     mask = self.output.get_sequence_mask()  # e.g. (B,T)
-    mask = tf.reshape(mask, tf.shape(loss)[0])
+    mask = tf.reshape(mask, [tf.shape(loss)[0]])
     loss = tf.where(mask, loss, tf.zeros_like(loss), "loss_masked")
     return loss
 

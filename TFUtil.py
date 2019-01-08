@@ -4773,7 +4773,7 @@ def smoothing_cross_entropy(logits,
   :return: Tensor of the same shape as `labels` and of the same dtype as `logits`.
   :rtype: tf.Tensor
   """
-  with tf.name_scope("smoothing_cross_entropy", [logits, labels]):
+  with tf.name_scope("smoothing_cross_entropy", values=[logits, labels]):
     if vocab_size is None:
       vocab_size = get_shape_dim(logits, -1, name="vocab_size")
     confidence = 1.0 - label_smoothing
@@ -5848,12 +5848,13 @@ def nested_get_shapes(x):
 
 
 def _get_control_flow_ops(v):
+  import numpy
   if isinstance(v, (list, tuple)):
     for elem in v:
       for t in _get_control_flow_ops(elem):
         yield t
     return
-  if isinstance(v, (int, float, type(None))):
+  if isinstance(v, (int, float, numpy.integer, type(None))):
     return
   if isinstance(v, tf.Tensor):
     v = v.op
