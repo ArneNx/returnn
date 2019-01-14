@@ -310,6 +310,7 @@ class LmDataset(CachedDataset2):
       return DatasetSeq(seq_idx=seq_idx, features=data, targets=targets, seq_tag=seq_tag)
 
 
+
 def _is_bliss(filename):
   """
   :param str filename:
@@ -974,7 +975,8 @@ class TranslationDataset(CachedDataset2):
   def _extend_data(self, k, data_strs):
     vocab = self._vocabs[k]
     data = [
-      self._data_str_to_numpy(vocab, s.decode("utf8").strip() + self._add_postfix[k])
+      self._data_str_to_numpy(vocab, s.decode("utf8","replace").strip() +
+                              self._add_postfix.get(k,self._add_postfix.get(self._main_data_key)))
       for s in data_strs]
     with self._lock:
       self._data[k].extend(data)
@@ -1029,9 +1031,10 @@ class TranslationDataset(CachedDataset2):
       filename = Util.cf(filename)
     return filename
 
-  def _get_data_file(self, prefix):
+  def _get_data_file(self, prefix, ext=None):
     """
     :param str prefix: e.g. "source" or "target"
+    :param str|None ext: e.g. ".npy"
     :return: full filename
     :rtype: io.FileIO
     """
@@ -1042,7 +1045,9 @@ class TranslationDataset(CachedDataset2):
     if os.path.exists(filename + ".gz"):
       import gzip
       return gzip.GzipFile(self._transform_filename(filename + ".gz"), "rb")
-    raise Exception("Data file not found: %r (.gz)?" % filename)
+    if ext and os.path.exists(filename + ext):
+      return open(self._transform_filename(filename + ext), "rb")
+    raise Exception("Data file not found: %r (.gz/%r)?" % (filename, ext))
 
   def _get_vocab(self, prefix):
     """
