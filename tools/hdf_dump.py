@@ -44,11 +44,29 @@ def hdf_dump_from_dataset(dataset, hdf_dataset, parser_args):
   if "orth" in data_keys:  # special workaround for now, not handled
     data_keys.remove("orth")
   data_target_keys = [key for key in dataset.get_target_list() if key in data_keys]
-  # Currently hardcoded, but we can make that more dynamic later...
-  default_data_input_key = "data"
-  default_data_target_key = "classes"
-  assert default_data_input_key in data_keys and default_data_input_key not in data_target_keys
-  assert default_data_target_key in data_target_keys
+  data_input_keys = [key for key in data_keys if key not in data_target_keys]
+  assert len(data_input_keys) > 0 and len(data_target_keys) > 0
+  if len(data_input_keys) > 1:
+    if "data" in data_input_keys:
+      default_data_input_key = "data"
+    else:
+      raise Exception("not sure which input data key to use from %r" % (data_input_keys,))
+  else:
+    default_data_input_key = data_input_keys[0]
+  print("Using input data key:", default_data_input_key)
+  if len(data_target_keys) > 1:
+    if "classes" in data_target_keys:
+      default_data_target_key = "classes"
+    else:
+      raise Exception("not sure which target data key to use from %r" % (data_target_keys,))
+  else:
+    default_data_target_key = data_target_keys[0]
+  print("Using target data key:", default_data_target_key)
+
+  hdf_data_key_map = {key: key for key in data_keys if key != default_data_input_key}
+  if "data" in hdf_data_key_map:
+    hdf_data_key_map["data"] = "classes"  # Replace "data" which is reserved for input key in HDFDataset.
+    assert "classes" not in hdf_data_key_map
 
   # We need to do one run through the dataset to collect some stats like total len.
   print("Collect stats, iterate through all data...", file=log.v3)
@@ -119,9 +137,8 @@ def hdf_dump_from_dataset(dataset, hdf_dataset, parser_args):
         'inputs', shape=shapes[data_key], dtype=dataset.get_data_dtype(data_key))
     else:
       hdf_dataset['targets/data'].create_dataset(
-        data_key, shape=shapes[data_key], dtype=dataset.get_data_dtype(data_key))
-      hdf_dataset['targets/size'].attrs[data_key] = dataset.num_outputs[data_key]
-
+        hdf_data_key_map[data_key], shape=shapes[data_key], dtype=dataset.get_data_dtype(data_key))
+      hdf_dataset['targets/size'].attrs[hdf_data_key_map[data_key]] = dataset.num_outputs[data_key]
     if data_key in dataset.labels:
       labels = dataset.labels[data_key]
       if PY3:
@@ -132,9 +149,10 @@ def hdf_dump_from_dataset(dataset, hdf_dataset, parser_args):
     print("Labels for %s:" % data_key, labels[:3], "...", file=log.v5)
     max_label_len = max(map(len, labels))
     if data_key != default_data_input_key:
-      hdf_dataset['targets/labels'].create_dataset(data_key, (len(labels),), dtype="S%i" % (max_label_len + 1))
+      hdf_dataset['targets/labels'].create_dataset(hdf_data_key_map[data_key],
+                                                   (len(labels),), dtype="S%i" % (max_label_len + 1))
       for i, label in enumerate(labels):
-        hdf_dataset['targets/labels'][data_key][i] = numpy.array(label, dtype="S%i" % (max_label_len + 1))
+        hdf_dataset['targets/labels'][hdf_data_key_map[data_key]][i] = numpy.array(label, dtype="S%i" % (max_label_len + 1))
 
   # Again iterate through dataset, and set the data
   print("Write data...", file=log.v3)
@@ -149,7 +167,7 @@ def hdf_dump_from_dataset(dataset, hdf_dataset, parser_args):
       if data_key == default_data_input_key:
         hdf_data = hdf_dataset['inputs']
       else:
-        hdf_data = hdf_dataset['targets/data'][data_key]
+        hdf_data = hdf_dataset['targets/data'][hdf_data_key_map[data_key]]
       data = dataset.get_data(seq_idx, data_key)
       hdf_data[offsets[data_key]:offsets[data_key] + seq_len[data_key]] = data
 
@@ -192,12 +210,12 @@ def init(config_filename, cmd_line_opts, dataset_config_str):
     rnn.initData()
     rnn.printTaskProperties()
     assert isinstance(rnn.train_data, Dataset)
-    return rnn.train_data
+    dataset = rnn.train_data
   else:
     assert dataset_config_str
     dataset = init_dataset(dataset_config_str)
-    print("Source dataset:", dataset.len_info(), file=log.v3)
-    return dataset
+  print("Source dataset:", dataset.len_info(), file=log.v3)
+  return dataset
 
 
 def _is_crnn_config(filename):
