@@ -1624,6 +1624,21 @@ def variable_summaries(var, name=None, with_histogram=False):
       tf.summary.histogram('%s_histogram' % name, var)
 
 
+def get_valid_scope_name_from_str(s):
+  """
+  :param str s: some name
+  :return: valid scope name, might be just s. see tf._VALID_SCOPE_NAME_REGEX and tf._VALID_OP_NAME_REGEX
+  :rtype: str
+  """
+  # For the root name scope, it's even more restrictive, and we must also cover this case.
+  # NOTE: Be careful changing this logic. Try to never change the behavior for existing cases,
+  # because this name is used e.g. for layers, and you might introduce incompatibility by changes here.
+  s = s.replace(":", "__")
+  if s[:1] in "_-\\/":  # invalid first chars
+    s = (".%i." % ord(s[0])) + s[1:]
+  return s
+
+
 def get_current_var_scope_name():
   """
   :return: current absolute variable scope name, via tf.variable_scope
@@ -6668,3 +6683,25 @@ def get_positional_encoding(num_channels, length=None, position=None, min_timesc
   signal = tf.concat([tf.sin(scaled_time), tf.cos(scaled_time)], axis=1)
   signal = tf.pad(signal, [[0, 0], [0, num_channels % 2]])  # (length, channels)
   return signal
+
+
+def get_non_deterministic_ops_from_graph():
+  """
+  Lists all non deterministic ops used in the default graph
+  If a non deterministic op is used multiple times each instance will be listed
+
+  currently doesn't check if user specified a specific computation device
+  list of non deterministic ops is not jet complete
+
+  :return: list of all non deterministic ops names (depending on device and tf version) used in current graph
+  :rtype: list[tf.Operation]
+  """
+  device_types = {device.device_type for device in get_tf_list_local_devices()}
+  non_det_ops = []
+  tf_version = tf_version_tuple()
+  for op in tf.get_default_graph().get_operations():
+    if op.type == "Mean" and tf_version <= (1, 5, 0) and "GPU" in device_types:
+      non_det_ops.append(op)
+    # elif ... more non det ops to be added
+
+  return non_det_ops

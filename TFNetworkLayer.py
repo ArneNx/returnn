@@ -292,11 +292,8 @@ class LayerBase(object):
     :return: valid scope name, might be just name. see tf._VALID_SCOPE_NAME_REGEX and tf._VALID_OP_NAME_REGEX
     :rtype: str
     """
-    # For the root name scope, it's even more restrictive, and we must also cover this case.
-    name = name.replace(":", "__")
-    if name[:1] in "_-\\/":  # invalid first chars
-      name = (".%i." % ord(name[0])) + name[1:]
-    return name
+    from TFUtil import get_valid_scope_name_from_str
+    return get_valid_scope_name_from_str(name)
 
   @classmethod
   def cls_layer_scope(cls, name):
@@ -2731,6 +2728,9 @@ class MergeDimsLayer(_ConcatInputLayer):
       input_data=input_data, merge_axes=axes, old_axis=input_data.batch_dim_axis)
     data.time_dim_axis = cls._old_axis_to_new_axis(
       input_data=input_data, merge_axes=axes, old_axis=input_data.time_dim_axis)
+    if data.time_dim_axis == data.batch_dim_axis:  # special case: batch and time got merged
+      # Fallback to some sensible default.
+      data.time_dim_axis = data.get_spatial_batch_axes()[0] if data.get_spatial_batch_axes() else None
     data.feature_dim_axis = new_feature_dim_axis
     return data
 
@@ -5428,7 +5428,7 @@ class Loss(object):
       # We expect to get (batch*time) or (time*batch) in the first dimension of the loss and the output.
       loss = self._reduce_to_batch_time_with_mask(loss, normalize=normalize)  # (batch*time,) or (time*batch,)
       loss.set_shape((None,))
-      loss = tf.reshape(loss, tf.shape(self.output.get_sequence_mask()))  # (batch,time) or (time,batch)
+      loss = tf.reshape(loss, tf.shape(self.output.placeholder)[:2])  # (batch,time) or (time,batch)
       loss = tf.reduce_sum(loss, axis=self.output.time_dim_axis)  # (batch,)
       if normalize:
         loss /= tf.to_float(self.output.get_sequence_lengths())

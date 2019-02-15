@@ -7,7 +7,8 @@ from tensorflow.python.ops import resource_variable_ops
 
 from Log import log
 from TFNetwork import TFNetwork
-from TFUtil import tf_version_tuple, assert_min_tf_version, CustomUpdate, add_check_numerics_ops
+from TFUtil import tf_version_tuple, assert_min_tf_version, CustomUpdate, add_check_numerics_ops, \
+  get_non_deterministic_ops_from_graph
 
 _OptimizerClassesDict = {}  # type: dict[str,()->Optimizer]
 
@@ -104,6 +105,12 @@ class Updater(object):
     self.optim_meta_losses = None  # type: dict[str,tf.Tensor]
     self.optimizer_vars = []  # type: list[tf.Variable]
     self.optimizer_init_vars_op = None  # type: tf.Operation
+
+    # After graph was build: look if it only uses deterministic ops
+    if self.config.is_true('deterministic_train'):
+      non_det_ops = get_non_deterministic_ops_from_graph()
+      if non_det_ops:
+        print("WARNING: The graph uses these non deterministic ops: {}".format(non_det_ops), file=log.v1)
 
   def reset_optim_op(self):
     """
@@ -237,9 +244,9 @@ class Updater(object):
         self.optim_op = tf.group(self.optim_op, *extra_updates_op_list)
 
     slot_names_per_optimizer = self.optimizer.get_slot_names_per_optimizer()
-    print("Initialize optimizer with slots %s." % slot_names_per_optimizer, file=log.v3)
     slot_vars = []
     for opt_key, slot_names in slot_names_per_optimizer.items():
+      print("Initialize optimizer (%s) with slots %s." % (opt_key or "default", slot_names), file=log.v3)
       for slot_name in slot_names:
         for v in self.optimizer.filter_var_list_per_optimizer_key(trainable_vars_for_gradients, opt_key=opt_key):
           slot_var = self.optimizer.get_slot(var=v, name=slot_name)
@@ -420,8 +427,12 @@ class WrapOptimizer:
       optimizer_opts = {"class": optimizer_opts}
     assert isinstance(optimizer_opts, dict)
     optimizer_opts = optimizer_opts.copy()
-    optim_class_name = optimizer_opts.pop("class")
-    optim_class = get_optimizer_class(optim_class_name)
+    if "class" in optimizer_opts:
+      optim_class_name = optimizer_opts.pop("class")
+      optim_class = get_optimizer_class(optim_class_name)
+    else:
+      _, default_opt = self._get_optimizer_item_for_opts(None, auto_create_new=True)
+      optim_class = default_opt.__class__
     from Util import collect_class_init_kwargs
     optim_class_kwargs = collect_class_init_kwargs(optim_class)
     if "epsilon" in optim_class_kwargs:
@@ -450,6 +461,7 @@ class WrapOptimizer:
     optim_config = self.config.typed_value("optimizer")
     if optim_config:
       assert isinstance(optim_config, (dict, str))
+      assert "class" in optim_config
       optimizer = self._create_optimizer(optim_config)
     elif self.config.bool("adam", False):
       assert not momentum
@@ -577,9 +589,24 @@ class WrapOptimizer:
       self.all_vars = all_vars
       self.var_grads = var_grads
       self.all_grads = list(var_grads.values())  # not necessarily the same length as all_vars
-      self._global_grad_norm = None
-      self._maximize_grad_norm_var_grads = None
+      self.vars_by_tag = self._build_vars_by_tag_dict()  # tag name -> set of vars
       self._l2loss_cache = {}
+      self._global_grad_norm = None
+      self._global_grad_norm_per_tag = {}
+      self._maximize_grad_norm_var_grads = None
+
+    def _build_vars_by_tag_dict(self):
+      """
+      :return: tag name -> set of vars
+      :rtype: dict[str,set[tf.Variable]]
+      """
+      res = {}
+      for var in self.all_vars:
+        opts = self.optimizer._get_updater_opts_from_var(var)
+        var_tags = opts.get("tags", [])
+        for tag in var_tags:
+          res.setdefault(tag, set()).add(var)
+      return res
 
     def get_l2loss(self, x):
       """
@@ -595,20 +622,48 @@ class WrapOptimizer:
           self._l2loss_cache[x] = tf.nn.l2_loss(values)
       return self._l2loss_cache[x]
 
-    def get_global_grad_norm(self):
+    def _global_norm(self, grads):
       """
+      :param list[tf.Tensor]|set[tf.Tensor] grads:
       :rtype: tf.Tensor
       """
+      if not isinstance(grads, (list, tuple)):
+        grads = sorted(grads, key=lambda v: v.name)  # make some deterministic order
+      # We want tf.global_norm(values), which is sqrt(sum([l2norm(t)**2 for t in values])),
+      # but we use self.get_l2loss which caches the calculation of l2norm.
+      # Thus this is tf.global_norm somewhat reproduced:
+      with tf.name_scope("global_norm"):
+        half_squared_norms = [self.get_l2loss(grad) for grad in grads if grad is not None]
+        half_squared_norm = tf.reduce_sum(tf.stack(half_squared_norms))
+        norm = tf.sqrt(half_squared_norm * tf.constant(2.0, dtype=half_squared_norm.dtype), name="global_norm")
+      return norm
+
+    def get_global_grad_norm(self, tag=None):
+      """
+      :param str|None tag:
+      :return: sqrt(sum(t**2 for t in all_grads))
+      :rtype: tf.Tensor
+      """
+      if tag:
+        return self.get_global_grad_norm_per_tag(tag=tag)
       if self._global_grad_norm is None:
-        # We want tf.global_norm(self.all_grads), which is sqrt(sum([l2norm(t)**2 for t in all_grads])),
-        # but we use self.get_l2loss which caches the calculation of l2norm.
-        # Thus this is tf.global_norm somewhat reproduced:
-        with tf.name_scope("global_norm"):
-          half_squared_norms = [self.get_l2loss(grad) for grad in self.all_grads]
-          half_squared_norm = tf.reduce_sum(tf.stack(half_squared_norms))
-          norm = tf.sqrt(half_squared_norm * tf.constant(2.0, dtype=half_squared_norm.dtype), name="global_norm")
-          self._global_grad_norm = norm
+        self._global_grad_norm = self._global_norm(self.all_grads)
       return self._global_grad_norm
+
+    def get_global_grad_norm_per_tag(self, tag):
+      """
+      :param str tag:
+      :return: sqrt(sum(t**2 for t in grads_of_vars_of_this_tag))
+      :rtype: tf.Tensor
+      """
+      if tag not in self._global_grad_norm_per_tag:
+        from TFUtil import get_valid_scope_name_from_str
+        with tf.name_scope("global_norm_for_tag_%s" % get_valid_scope_name_from_str(tag)):
+          norm = self._global_norm({self.var_grads[var] for var in self.vars_by_tag[tag]})
+        if self.optimizer.config.bool_or_other("debug_grad_summaries", False):
+          tf.summary.scalar("global_norm_for_tag_%s" % get_valid_scope_name_from_str(tag), norm)
+        self._global_grad_norm_per_tag[tag] = norm
+      return self._global_grad_norm_per_tag[tag]
 
     def get_maximize_grad_norm_var_grads(self, factor):
       """
@@ -630,16 +685,44 @@ class WrapOptimizer:
       """
       return self.get_maximize_grad_norm_var_grads(factor).get(var, None)
 
-    def clip_by_global_norm(self, grad, clip_norm):
+    def clip_by_global_norm(self, grad, clip_norm, global_norm_tag=None):
       """
       Wraps tf.clip_by_global_norm.
 
       :param tf.Tensor grad:
       :param tf.Tensor|float clip_norm:
+      :param str|None global_norm_tag:
       :rtype: tf.Tensor
       """
-      (grad,), _ = tf.clip_by_global_norm([grad], clip_norm=clip_norm, use_norm=self.get_global_grad_norm())
+      norm = self.get_global_grad_norm(tag=global_norm_tag)
+      (grad,), _ = tf.clip_by_global_norm([grad], clip_norm=clip_norm, use_norm=norm)
       return grad
+
+    def set_zero_on_high_global_norm(self, grad, grad_norm_threshold, global_norm_tag=None):
+      """
+      :param tf.Tensor grad:
+      :param float grad_norm_threshold:
+      :param str|None global_norm_tag:
+      :rtype: tf.Tensor
+      """
+      norm = self.get_global_grad_norm(tag=global_norm_tag)
+      # Also check nan/inf. Treat them as if we would have been over grad_norm_threshold.
+      zero_cond = tf.logical_or(tf.is_nan(norm), tf.is_inf(norm))
+      zero_cond = tf.logical_or(zero_cond, tf.greater(norm, grad_norm_threshold))
+      return tf.where(zero_cond, tf.zeros_like(grad), grad)
+
+  @classmethod
+  def _get_updater_opts_from_var(cls, var):
+    """
+    :param tf.Variable var:
+    :rtype: Util.CollectionReadCheckCovered
+    """
+    from Util import CollectionReadCheckCovered
+    updater_opts = getattr(var, "RETURNN_updater_opts", None)
+    if updater_opts is None:
+      updater_opts = CollectionReadCheckCovered({})
+    assert isinstance(updater_opts, CollectionReadCheckCovered)
+    return updater_opts
 
   def _post_process_grad(self, grad, var, global_info):
     """
@@ -649,22 +732,24 @@ class WrapOptimizer:
     :return: new grad, apply grad opts
     :rtype: tf.Tensor, dict[str]
     """
-    from Util import CollectionReadCheckCovered
-    updater_opts = getattr(var, "RETURNN_updater_opts", None)
-    if updater_opts is None:
-      updater_opts = CollectionReadCheckCovered({})
-    assert isinstance(updater_opts, CollectionReadCheckCovered)
+    updater_opts = self._get_updater_opts_from_var(var)
 
     accum_grad_multiple_num_steps = updater_opts.get(
       "accum_grad_multiple_step", self.config.int("accum_grad_multiple_step", 0))
     grad_noise = updater_opts.get("gradient_noise", self.config.float("gradient_noise", 0.0))
     grad_clip = updater_opts.get("gradient_clip", self.config.float("gradient_clip", 0.0))
+    # E.g. https://github.com/openai/baselines/blob/master/baselines/deepq/simple.py:
+    #   grad_norm_clipping=10 -> tf.clip_by_norm
     grad_clip_norm = updater_opts.get("gradient_clip_norm", self.config.float("gradient_clip_norm", 0.0))
     grad_clip_avg_norm = updater_opts.get("gradient_clip_avg_norm", self.config.float("gradient_clip_avg_norm", 0.0))
     grad_clip_global_norm = updater_opts.get(
       "gradient_clip_global_norm", self.config.float("gradient_clip_global_norm", 0.0))
-    # E.g. https://github.com/openai/baselines/blob/master/baselines/deepq/simple.py:
-    #   grad_norm_clipping=10 -> tf.clip_by_norm
+    global_norm_tag = updater_opts.get(
+      "global_norm_tag", self.config.value("global_norm_tag", None))
+    grad_clip_global_norm_tag = updater_opts.get(
+      "gradient_clip_global_norm_tag", self.config.value("gradient_clip_global_norm_tag", global_norm_tag))
+    grad_norm_to_clip_to_zero = updater_opts.get(
+      "grad_norm_to_clip_to_zero", self.config.float("grad_norm_to_clip_to_zero", 0.0))
     maximize_grad_norm = updater_opts.get("maximize_grad_norm", self.config.float("maximize_grad_norm", 0))
 
     if maximize_grad_norm:
@@ -684,9 +769,6 @@ class WrapOptimizer:
         variable_summaries(var, name=get_base_name(var))
 
     # Also see tf.contrib.layers.optimizers.optimize_loss() for reference.
-    if updater_opts.get("gradient_nan_inf_filter", self.config.bool("gradient_nan_inf_filter", False)):
-      from TFUtil import nan_to_num
-      grad = nan_to_num(grad, nan_num=0.0, inf_num=0.0)
     if grad_noise:
       assert grad_noise > 0
       from TFUtil import add_scaled_noise_to_gradients
@@ -707,7 +789,15 @@ class WrapOptimizer:
     if grad_clip_global_norm:
       assert grad_clip_global_norm > 0
       with tf.name_scope("grad_clip_global_norm"):
-        grad = global_info.clip_by_global_norm(grad, clip_norm=grad_clip_global_norm)
+        grad = global_info.clip_by_global_norm(
+          grad, clip_norm=grad_clip_global_norm, global_norm_tag=grad_clip_global_norm_tag)
+    if updater_opts.get("gradient_nan_inf_filter", self.config.bool("gradient_nan_inf_filter", False)):
+      from TFUtil import nan_to_num
+      grad = nan_to_num(grad, nan_num=0.0, inf_num=0.0)
+    if grad_norm_to_clip_to_zero:
+      with tf.name_scope("grad_norm_to_clip_to_zero"):
+        grad = global_info.set_zero_on_high_global_norm(
+          grad, grad_norm_threshold=grad_norm_to_clip_to_zero, global_norm_tag=global_norm_tag)
 
     updater_opts.assert_all_read()
 

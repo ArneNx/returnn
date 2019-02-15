@@ -207,7 +207,7 @@ class RecLayer(_ConcatInputLayer):
       if not p.name.startswith(scope_name_prefix):
         continue
       assert p.name.startswith(scope_name_prefix) and p.name.endswith(":0")
-      self.params[p.name[len(scope_name_prefix):-2]] = p
+      self.add_param(p)
 
   def get_dep_layers(self):
     l = super(RecLayer, self).get_dep_layers()
@@ -420,7 +420,7 @@ class RecLayer(_ConcatInputLayer):
             loss = subnet.accumulated_losses[loss.name]
             assert isinstance(loss, LossHolder)
             assert loss.get_layer()
-          loss = loss.copy_new_base(network=network, name="%s/%s" % (name, loss.name))
+          loss = loss.copy_new_base(network=network, name="%s/%s" % (name, loss.name), reduce_func=reduce_func)
           losses.append(loss)
     return losses
 
@@ -2527,7 +2527,8 @@ class RnnCellLayer(_ConcatInputLayer):
       self.rec_vars_outputs["state"] = state
       params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=re.escape(scope_name_prefix))
       assert params
-      self.params.update({p.name[len(scope_name_prefix):-2]: p for p in params})
+      for p in params:
+        self.add_param(p)
 
   @classmethod
   def _get_cell(cls, n_out, unit, unit_opts=None):
