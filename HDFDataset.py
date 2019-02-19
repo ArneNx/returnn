@@ -986,7 +986,7 @@ class HDFDatasetWriter:
         progress_bar_with_time(float(i) / num_seqs)
 
     print("Set seq len info...", file=log.v3)
-    hdf_dataset.create_dataset(attr_seqLengths, shape=(num_seqs, 2), dtype="int32")
+    hdf_dataset.create_dataset(attr_seqLengths, shape=(num_seqs, 1+len(data_target_keys)), dtype="int32")
     for i, seq_len in enumerate(seq_lens):
       data_len = seq_len[default_data_input_key]
       targets_len = seq_len[default_data_target_key]
@@ -994,7 +994,7 @@ class HDFDatasetWriter:
         assert seq_len[data_key] == targets_len, "different lengths in multi-target not supported"
       if targets_len is None:
         targets_len = data_len
-      hdf_dataset[attr_seqLengths][i] = [data_len, targets_len]
+      hdf_dataset[attr_seqLengths][i] = [seq_len[default_data_input_key]] + [seq_len[k] for k in data_target_keys]
       if use_progress_bar:
         progress_bar_with_time(float(i) / num_seqs)
 
