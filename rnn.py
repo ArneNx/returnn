@@ -44,10 +44,11 @@ quit = False
 server = None; """:type: Server"""
 
 
-def initConfig(configFilename=None, commandLineOptions=(), extra_updates=None):
+def initConfig(configFilename=None, commandLineOptions=(), default_config=None, extra_updates=None):
   """
   :param str|None configFilename:
   :param list[str]|tuple[str] commandLineOptions: e.g. ``sys.argv[1:]``
+  :param dict[str]|None default_config:
   :param dict[str]|None extra_updates:
 
   Initializes the global config.
@@ -88,6 +89,8 @@ def initConfig(configFilename=None, commandLineOptions=(), extra_updates=None):
       i += 1
     commandLineOptions = commandLineOptions[i:]
 
+  if default_config:
+    config.update(default_config)
   if extra_updates:
     config.update(extra_updates)
   if commandLineOptions:
@@ -225,6 +228,8 @@ def initData():
     chunking = config.value("batch_size", "0")
   elif config.value('chunking', "0") == "1": # MLP mode
     chunking = "1"
+  elif config.bool('chunk_eval', False):
+    chunking = config.value('chunking', "0")
   global train_data, dev_data, eval_data
   dev_data, extra_cache_bytes_dev = load_data(
     config, cache_byte_sizes[1], 'dev', chunking=chunking, seq_ordering="sorted", shuffle_frames_of_nseqs=0)

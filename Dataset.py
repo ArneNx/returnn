@@ -253,20 +253,6 @@ class Dataset(object):
     """
     raise NotImplementedError
 
-  def init_seq_order(self, epoch=None, seq_list=None):
-    """
-    :type epoch: int|None
-    :param list[str] | None seq_list: In case we want to set a predefined order.
-    :rtype: bool
-    :returns whether the order changed (True is always safe to return)
-
-    This is called when we start a new epoch, or at initialization.
-    Call this when you reset the seq list.
-    """
-    self.epoch = epoch
-    self.rnd_seq_drop = Random(epoch or 1)
-    return False
-
   def get_seq_order_for_epoch(self, epoch, num_seqs, get_seq_len=None):
     """
     Returns the order of the given epoch.
@@ -290,6 +276,15 @@ class Dataset(object):
     seq_index = list(range(num_seqs)); """ :type: list[int]. the real seq idx after sorting """
     if self.seq_ordering == 'default':
       pass  # Keep order as-is.
+    elif self.seq_ordering.startswith("default_every_n:"):
+      # This order is useful if you have "initial_state": "keep_over_epoch",
+      # where num == max_seqs, batch_size = inf, max_seq_len = inf, chunking = None.
+      _, num = self.seq_ordering.split(":")
+      num = int(num)
+      seq_index = numpy.arange(num_seqs // num, dtype="int64").repeat(num)
+      for i in range(1, num):
+        seq_index[i::num] += i * (num_seqs // num)
+      seq_index = list(seq_index)
     elif self.seq_ordering == 'reverse':
       seq_index = list(reversed(seq_index))
     elif self.seq_ordering == 'sorted':
@@ -361,6 +356,29 @@ class Dataset(object):
     assert len(seq_index) == partition_sizes[current_partition]
 
     return seq_index
+
+  def init_seq_order(self, epoch=None, seq_list=None):
+    """
+    :type epoch: int|None
+    :param list[str] | None seq_list: In case we want to set a predefined order.
+    :rtype: bool
+    :returns whether the order changed (True is always safe to return)
+
+    This is called when we start a new epoch, or at initialization.
+    Call this when you reset the seq list.
+    """
+    self.epoch = epoch
+    self.rnd_seq_drop = Random(epoch or 1)
+    return False
+
+  def get_current_seq_order(self):
+    """
+    :return: many datasets use self.get_seq_order_for_epoch. this function would return the current seq order
+      for the current epoch, after self.init_seq_order was called.
+      Not all datasets implement this.
+    :rtype: list[int]
+    """
+    raise NotImplementedError
 
   def _base_init(self):
     self.nbytes = 0
@@ -453,6 +471,33 @@ class Dataset(object):
     :rtype: str
     """
     return "seq-%i" % sorted_seq_idx
+
+  def get_all_tags(self):
+    """
+    :return: list of all seq tags, of the whole dataset, without partition epoch.
+      Note that this is not possible with all datasets.
+    :rtype: list[str]
+    """
+    old_partition_epoch = self.partition_epoch
+    try:
+      all_tags = [None] * self.num_seqs
+      for seq_idx in range(self.num_seqs):
+        all_tags[seq_idx] = self.get_tag(seq_idx)
+      return all_tags
+    finally:
+      self.partition_epoch = old_partition_epoch
+
+  def get_total_num_seqs(self):
+    """
+    :return: total number of seqs, without partition epoch.
+      Should be the same as len(self.get_all_tags()).
+      Note that this is not possible with all datasets.
+    :rtype: int
+    """
+    if self.partition_epoch == 1:
+      # Note: self.num_seqs might not always be set, or even be correct...
+      return self.num_seqs
+    raise NotImplementedError("%s: get_total_num_seqs with partition epoch %i" % (self, self.partition_epoch))
 
   def have_corpus_seq_idx(self):
     """
@@ -663,7 +708,7 @@ class Dataset(object):
     while self.is_less_than_num_seqs(s):
       length = self.get_seq_length(s)
       if chunk_size == 0:
-        yield (s, length.constant_like(0), length)
+        yield (s, NumbersDict.constant_like(0, numbers_dict=length), length)
       else:
         default_key = "data"
         if used_data_keys is not None:
@@ -674,7 +719,7 @@ class Dataset(object):
             assert chunk_step.max_value() > 0
             default_key = [key for key in sorted(used_data_keys) if chunk_step[key] > 0][0]
         assert chunk_step[default_key] > 0
-        t = length.constant_like(0)
+        t = NumbersDict.constant_like(0, numbers_dict=length)
         # There are usually the 'data' (input) and 'classes' (targets) data-keys in `length` but there can be others.
         # We expect them all of the same length so that we can do chunking.
         # In case that some length is 0 or 1,
@@ -733,7 +778,7 @@ class Dataset(object):
     :rtype: (NumbersDict,NumbersDict)
     """
     end = self.get_seq_length(seq_idx)
-    start = end.constant_like(0)
+    start = NumbersDict.constant_like(0, numbers_dict=end)
     ctx_lr = self._get_context_window_left_right()
     if ctx_lr:
       start -= ctx_lr[0]
@@ -758,15 +803,16 @@ class Dataset(object):
     """
     :param bool recurrent_net: If True, the batch might have a batch seq dimension > 1.
       Otherwise, the batch seq dimension is always 1 and multiple seqs will be concatenated.
-    :param int batch_size: Max number of frames in one batch.
+    :param int|dict[str,int]|NumbersDict batch_size: Max number of frames in one batch.
     :param int max_seqs: Max number of seqs per batch.
     :param int max_total_num_seqs:
     :param int|dict[str,int]|NumbersDict max_seq_length:
     :param set(str)|None used_data_keys:
     """
-    if batch_size == 0:
+    if not batch_size:
       batch_size = sys.maxsize
-    assert batch_size > 0
+    batch_size = NumbersDict(batch_size)
+    assert not batch_size.any_compare(NumbersDict(0), (lambda a, b: a <= b))
     if max_seqs == -1:
       max_seqs = float('inf')
     if not max_seq_length:
@@ -806,22 +852,24 @@ class Dataset(object):
           continue
         if length.any_compare(min_seq_length, (lambda a, b: a < b)):
           continue
-        if length.max_value() > batch_size:
-          print("warning: sequence length (%i) larger than limit (%i)" % (length.max_value(), batch_size), file=log.v4)
+        if length.any_compare(batch_size, (lambda a, b: a > b)):
+          print("warning: sequence length (%r) larger than limit (%r)" % (length, batch_size), file=log.v4)
         if self.rnd_seq_drop.random() < seq_drop:
           continue
         dt, ds = batch.try_sequence_as_slice(length)
-        if ds > 1 and ((dt * ds).max_value() > batch_size or ds > max_seqs):
+        if ds > 1 and ((dt * ds).any_compare(batch_size, (lambda a, b: a > b)) or ds > max_seqs):
           yield batch
           batch = Batch()
         batch.add_sequence_as_slice(seq_idx=seq_idx, seq_start_frame=t_start, length=length)
       else:  # Not recurrent.
         while t_start.max_value() < t_end.max_value():
           length = t_end - t_start
-          num_frames = NumbersDict.min([length, batch_size - batch.get_all_slices_num_frames()])
+          num_frames = NumbersDict.min(
+            [length, batch_size.copy_like(length) - batch.get_all_slices_num_frames().copy_like(length)])
           assert num_frames.max_value() > 0
           batch.add_frames(seq_idx=seq_idx, seq_start_frame=t_start, length=num_frames)
-          if batch.get_all_slices_num_frames() >= batch_size or batch.get_num_seqs() > max_seqs:
+          if (batch.get_all_slices_num_frames().any_compare(batch_size, (lambda a, b: a >= b))
+                  or batch.get_num_seqs() > max_seqs):
             yield batch
             batch = Batch()
           t_start += num_frames
@@ -829,9 +877,7 @@ class Dataset(object):
         last_seq_idx = seq_idx
         total_num_seqs += 1
 
-
-
-    if batch.get_all_slices_num_frames() > 0:
+    if batch.get_all_slices_num_frames().max_value() > 0:
       yield batch
 
   def batch_set_generator_cache_whole_epoch(self):
@@ -994,7 +1040,7 @@ def init_dataset_via_str(config_str, config=None, cache_byte_size=None, **kwargs
     if not config:
       config = get_global_config()
     data = eval(config_str[len("config:"):], config.typed_dict, config.typed_dict)
-    return init_dataset(data)
+    return init_dataset(data, extra_kwargs=kwargs)
   elif ":" in config_str:
     kwargs.update(eval("dict(%s)" % config_str[config_str.find(":") + 1:]))
     class_name = config_str[:config_str.find(":")]

@@ -1,6 +1,7 @@
 
 from __future__ import print_function
 import gc
+import sys
 import time
 import numpy
 import functools
@@ -18,7 +19,9 @@ class CachedDataset(Dataset):
     """
     super(CachedDataset, self).__init__(**kwargs)
     self.cache_byte_size_total_limit = cache_byte_size
-    if cache_byte_size <= 0:
+    if cache_byte_size == -1:
+      self.cache_byte_size_limit_at_start = 1024 ** 4
+    elif cache_byte_size == 0:
       self.cache_byte_size_limit_at_start = 0
     else:
      self.cache_byte_size_limit_at_start = max(cache_byte_size * 2 // 3, 1)
@@ -26,11 +29,13 @@ class CachedDataset(Dataset):
     self.num_seqs_cached_at_start = 0
     self.cached_bytes_at_start = 0
     self.start_cache_initialized = False
+    self.definite_cache_leftover = 0
+    self.cache_num_frames_free = 0
     self.preload_set = set([])
     self.preload_end = 0
     self.max_ctc_length = 0
     self.ctc_targets = None
-    self.alloc_intervals = None
+    self.alloc_intervals = None  # type: list
     self._seq_start = []  # [numpy.array([0,0])]  # uses sorted seq idx, see set_batching()
     self._seq_index = []; """ :type: list[int] """  # Via init_seq_order(). seq_index idx -> hdf seq idx
     self._index_map = range(len(self._seq_index))  # sorted seq idx -> seq_index idx
@@ -43,16 +48,17 @@ class CachedDataset(Dataset):
   def initialize(self):
     super(CachedDataset, self).initialize()
 
-    # Calculate cache sizes.
-    temp_cache_size_bytes = max(0, self.cache_byte_size_total_limit)
-    self.definite_cache_leftover = temp_cache_size_bytes if self.num_seqs_cached_at_start == self.num_seqs else 0
-    self.cache_num_frames_free = temp_cache_size_bytes // self.nbytes
+    if self.cache_byte_size_limit_at_start > 0:
+      # Calculate cache sizes.
+      temp_cache_size_bytes = max(0, self.cache_byte_size_total_limit)
+      self.definite_cache_leftover = temp_cache_size_bytes if self.num_seqs_cached_at_start == self.num_seqs else 0
+      self.cache_num_frames_free = temp_cache_size_bytes // self.nbytes
 
-    print("cached %i seqs" % self.num_seqs_cached_at_start,
-          "%s GB" % (self.cached_bytes_at_start / float(1024 * 1024 * 1024)),
-          ("(fully loaded, %s GB left over)" if self.definite_cache_leftover else "(%s GB free)") %
-          max(temp_cache_size_bytes / float(1024 * 1024 * 1024), 0),
-          file=log.v4)
+      print("cached %i seqs" % self.num_seqs_cached_at_start,
+            "%s GB" % (self.cached_bytes_at_start / float(1024 * 1024 * 1024)),
+            ("(fully loaded, %s GB left over)" if self.definite_cache_leftover else "(%s GB free)") %
+            max(temp_cache_size_bytes / float(1024 * 1024 * 1024), 0),
+            file=log.v4)
 
   def init_seq_order(self, epoch=None, seq_list=None):
     """
@@ -104,6 +110,8 @@ class CachedDataset(Dataset):
     return True
 
   def _init_alloc_intervals(self):
+    if self.cache_byte_size_limit_at_start == 0:
+      return
     assert self.num_seqs > 0
     assert self.num_inputs > 0
     assert self.window > 0
@@ -116,12 +124,16 @@ class CachedDataset(Dataset):
     # and data is a numpy.array.
 
   def _init_seq_starts(self):
+    if self.cache_byte_size_limit_at_start == 0:
+      return
     self._seq_start = [self._seq_start[0] * 0]  # idx like in seq_index, *not* real idx
     for i in range(self.num_seqs):
       ids = self._seq_index[i]
       self._seq_start.append(self._seq_start[-1] + self._seq_lengths[ids])
 
   def _init_start_cache(self):
+    if self.cache_byte_size_limit_at_start == 0:
+      return
     if not self.alloc_intervals:
       return
     if not self.nbytes:
@@ -140,7 +152,10 @@ class CachedDataset(Dataset):
     self.cached_bytes_at_start = cached_bytes
     if num_cached > 0:
       self.preload_end = num_cached
-      threading.Thread(target=self._preload_seqs,args=(0,num_cached)).start()
+      if sys.version_info >= (3, 0):
+        threading.Thread(target=self._preload_seqs, args=(0, num_cached), daemon=True).start()
+      else:
+        threading.Thread(target=self._preload_seqs, args=(0, num_cached)).start()
 
   def load_seqs(self, start, end):
     """
@@ -157,9 +172,10 @@ class CachedDataset(Dataset):
     assert start >= 0
     assert start <= end
 
-    if self.is_cached(start, end, blocking=True): return
+    if self.is_cached(start, end, blocking=True):
+      return
 
-    if self.cache_byte_size_total_limit > 0:  # If the cache is enabled.
+    if self.cache_byte_size_limit_at_start > 0:  # If the cache is enabled.
       self._load_seqs_with_cache(start, end)
       return self.is_cached(start, end, blocking=True)
 
@@ -252,10 +268,12 @@ class CachedDataset(Dataset):
       if alloc_start <= ids < alloc_end:
         return i
       elif alloc_start <= ids and ids >= alloc_end:
-        if s == i: return -1
+        if s == i:
+          return -1
         s = i
       elif alloc_start > ids:
-        if e == i: return -1
+        if e == i:
+          return -1
         e = i
       else:
         assert False
@@ -268,6 +286,8 @@ class CachedDataset(Dataset):
     :param (int,int) value: (start,end) like in load_seqs(), sorted seq idx
     :rtype: int
     """
+    if value[0] == value[1]:
+      return 0
     ci = self.alloc_intervals[pos][1]
     ni = self.alloc_intervals[pos + 1][0]
     xc = self.alloc_intervals[pos][2]
@@ -339,8 +359,10 @@ class CachedDataset(Dataset):
     :rtype: list[int]
     :return selection list, modified sorted seq idx in self.alloc_intervals
     """
-    if end is None: end = start + 1
-    if start == end: return
+    if end is None:
+      end = start + 1
+    if start == end:
+      return
     assert start < end
     i = 0
     selection = []; """ :type: list[int] """
@@ -348,6 +370,7 @@ class CachedDataset(Dataset):
     while i < len(self.alloc_intervals) - invert:
       ni = self.alloc_intervals[i + invert][1 - invert]  # insert mode: start idx of next alloc
       ci = self.alloc_intervals[i][invert]               # insert mode: end idx of cur alloc
+      assert ci <= ni
       flag = ((ci <= start < ni), (ci < end <= ni), (ci < start and ni <= start) or (ci >= end and ni > end))
       if not flag[0] and not flag[1]:
         if not flag[2]:
@@ -412,7 +435,10 @@ class CachedDataset(Dataset):
     :returns whether we have the full range (start,end) of sorted seq idx
       cached in self.alloc_intervals (end is exclusive).
     """
-    if start == end: return True  # Empty.
+    if self.cache_byte_size_total_limit == 0:  # disabled cache
+      return False
+    if start == end:
+      return True  # Empty.
     assert start < end
     if blocking and end <= self.preload_end:
       while not set(range(start,end)) <= self.preload_set:
@@ -464,9 +490,7 @@ class CachedDataset(Dataset):
   def get_data_dim(self, key):
     if key == "data":
       return self.num_inputs * self.window
-    if key in self.num_outputs:
-      return self.num_outputs[key][0]
-    return 1 if len(self.targets[key].shape) == 1 else self.targets[key].shape[1]
+    return self.num_outputs[key][0]
 
   def get_targets(self, target, sorted_seq_idx):
     seq_idx = self._index_map[sorted_seq_idx]

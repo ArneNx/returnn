@@ -819,6 +819,33 @@ class RecurrentUnitLayer(Layer):
     # scan over sequence
     for s in range(self.attrs['sampling']):
       index = self.index[s::self.attrs['sampling']]
+
+      if context > 0:
+        from TheanoUtil import context_batched
+        n_batches = z.shape[1]
+        time, batch, dim = z.shape[0], z.shape[1], z.shape[2]
+        #z = context_batched(z[::direction or 1], window=context)[::direction or 1] # TB(CD)
+
+        from theano.ifelse import ifelse
+        def context_window(idx, x_in, i_in):
+          x_out = x_in[idx:idx + context]
+          x_out = x_out.dimshuffle('x',1,0,2).reshape((1, batch, dim * context))
+          i_out = i_in[idx:idx+1].repeat(context, axis=0)
+          i_out = ifelse(T.lt(idx,context),T.set_subtensor(i_out[:context - idx],numpy.int8(0)),i_out).reshape((1, batch * context))
+          return x_out, i_out
+
+        z = z[::direction or 1]
+        i = index[::direction or 1]
+        out, _ = theano.map(context_window, sequences = [T.arange(z.shape[0])], non_sequences = [T.concatenate([T.zeros((context - 1,z.shape[1],z.shape[2]),dtype='float32'),z],axis=0), i])
+        z = out[0][::direction or 1]
+        i = out[1][::direction or 1] # T(BC)
+        direction = 1
+        z = z.reshape((time * batch, context * dim)) # (TB)(CD)
+        z = z.reshape((time * batch, context, dim)).dimshuffle(1,0,2) # C(TB)D
+        i = i.reshape((time, context, batch)).dimshuffle(1,0,2).reshape((context, time * batch))
+        index = i
+        num_batches = time * batch
+
       sequences = z
       sources = self.sources
       if encoder:
@@ -852,18 +879,6 @@ class RecurrentUnitLayer(Layer):
       index_f = T.cast(index, theano.config.floatX)
       unit.set_parent(self)
 
-      if context > 0:
-        from TheanoUtil import context_batched
-        n_batch = sequences.shape[1]
-        sequences = context_batched(sequences[::-direction], window=context)[::-direction] # TB(CD)
-        sequences = sequences.reshape((1, sequences.shape[0] * sequences.shape[1], sequences.shape[2])) # 1(TB)(CD)
-        sequences = sequences.reshape((1, sequences.shape[1], context, sequences.shape[2]//context)) # 1(TB)CD
-        sequences = sequences.dimshuffle(0,2,1,3).reshape((context, sequences.shape[1], sequences.shape[3])) # C(TB)D
-
-        index_f = index.reshape((1, index_f.shape[0] * index_f.shape[1])).repeat(context,axis=0) # C(TB)
-        outputs_info = [ T.alloc(numpy.cast[theano.config.floatX](0), index_f.shape[1], unit.n_units) for a in range(unit.n_act) ]
-
-
       if segment_input:
         outputs = unit.scan_seg(x=sources,
                                 z=sequences[s::self.attrs['sampling']],
@@ -892,12 +907,9 @@ class RecurrentUnitLayer(Layer):
         outputs = [outputs]
       if outputs:
         outputs[0].name = "%s.act[0]" % self.name
-        from TheanoUtil import context_batched
         if context > 0:
           for i in range(len(outputs)):
-            outputs[i] = outputs[i][-1:]
-            outputs[i] = outputs[i].reshape((outputs[i].shape[0] * outputs[i].shape[1],outputs[i].shape[2]))
-            outputs[i] = outputs[i].reshape((outputs[i].shape[0]//n_batch,n_batch,outputs[i].shape[1]))
+            outputs[i] = outputs[i][-1].reshape((outputs[i].shape[1]//n_batches,n_batches,outputs[i].shape[2]))
 
       if unit.recurrent_transform:
         unit.recurrent_transform_state_var_seqs = outputs[-len(unit.recurrent_transform.state_vars):]

@@ -665,7 +665,9 @@ class StaticDataset(GeneratingDataset):
       for key in target_list:
         assert key in self.data_keys
     else:
-      target_list = self.data_keys
+      target_list = list(self.data_keys)
+      if "data" in target_list:
+        target_list.remove("data")
     self.target_list = target_list
 
     if output_dim is None:
@@ -677,6 +679,8 @@ class StaticDataset(GeneratingDataset):
     for key, value in first_data.items():
       if key not in output_dim:
         output_dim[key] = [value.shape[-1] if value.ndim >= 2 else 0, len(value.shape)]
+    if input_dim is None and "data" in self.data_keys:
+      input_dim = output_dim["data"][0]
     for key in self.data_keys:
       first_data_output = first_data[key]
       assert len(first_data_output.shape) <= 2  # (time[,dim])
@@ -697,6 +701,9 @@ class StaticDataset(GeneratingDataset):
 
   def get_target_list(self):
     return self.target_list
+
+  def get_data_dtype(self, key):
+    return self.data[0][key].dtype
 
 
 class CopyTaskDataset(GeneratingDataset):
@@ -2106,6 +2113,9 @@ class LibriSpeechCorpus(CachedDataset2):
         print("%s, epoch %i. No filter for this epoch." % (self, epoch), file=log.v4)
     return True
 
+  def get_current_seq_order(self):
+    return self._seq_order
+
   def _get_ref_seq_idx(self, seq_idx):
     """
     :param int seq_idx:
@@ -2135,6 +2145,12 @@ class LibriSpeechCorpus(CachedDataset2):
     :rtype: str
     """
     return self._get_tag(self._get_ref_seq_idx(seq_idx))
+
+  def get_all_tags(self):
+    return [self._get_tag(i) for i in range(len(self._reference_seq_order))]
+
+  def get_total_num_seqs(self):
+    return len(self._reference_seq_order)
 
   def _get_transcription(self, seq_idx):
     """

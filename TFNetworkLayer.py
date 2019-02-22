@@ -111,7 +111,7 @@ class LayerBase(object):
       self.output = output
       if n_out:
         assert self.output.dim == n_out
-      if out_type:
+      if isinstance(out_type, dict):
         if "shape" in out_type:
           assert self.output.shape == out_type["shape"]
         if "dim" in out_type:
@@ -196,7 +196,7 @@ class LayerBase(object):
 
     :param TFNetwork.TFNetwork network:
     :param str name:
-    :param dict[str]|None out_type:
+    :param dict[str]|None|(()->Data) out_type:
     :param int|None n_out:
     :param str|None target:
     :param str|None size_target:
@@ -206,21 +206,26 @@ class LayerBase(object):
     :return: Data template (placeholder not set)
     :rtype: Data
     """
-    if n_out is None and target:
-      n_out = cls._static_get_target_value(target=target, network=network, mark_data_key_as_used=False).dim
+    if callable(out_type):
+      return out_type(
+        network=network, name=name, n_out=n_out, target=target, size_target=size_target, sources=sources, loss=loss,
+        **kwargs)
     if out_type is None:
-      assert n_out
-      out_type = {"dim": n_out}
-    out_type = out_type.copy()
+      out_type = {}
+    else:
+      out_type = out_type.copy()
     out_type.setdefault("name", "%s_output" % name)
+    if "dim" not in out_type and n_out is not None:
+      out_type["dim"] = n_out
+    if "dim" not in out_type and target:
+      out_type["dim"] = cls._static_get_target_value(target=target, network=network, mark_data_key_as_used=False).dim
+    if n_out is not None:
+      assert out_type["dim"] == n_out
     sources_data = None
     if sources and sources[0]:
       sources_data = sources[0].output.copy_template()
     if sources_data and not sources_data.sparse and not out_type.get("sparse", False):
       out_type.setdefault("dtype", sources_data.dtype)
-    if n_out is not None:
-      out_type.setdefault("dim", n_out)
-      assert out_type["dim"] == n_out
     # You are supposed to set self.output.{batch_dim_axis,time_dim_axis} explicitly,
     # as well as check the inputs if they are as you would suggest.
     # However, a good default is often to use the same as the input.
@@ -370,13 +375,15 @@ class LayerBase(object):
     if "reuse_params" in d:
       d["reuse_params"] = ReuseParams.from_config_dict(d["reuse_params"], network=network, get_layer=get_layer)
     if d.get("loss", None) and "target" not in d:
-      d["target"] = network.extern_data.default_target
+      target = get_loss_class(d["loss"]).get_default_target(network.extern_data)
+      if target:
+        d["target"] = target
     targets = None
-    if d.get("target"):
+    if d.get("target", None):
       targets = d["target"]
       # we might have multiple targets, e.g. in choice layer, so convert to list
       if isinstance(targets, str):
-          targets = [targets]
+        targets = [targets]
       if network.eval_flag:
         for target in targets:
           assert isinstance(target, str)
@@ -417,7 +424,8 @@ class LayerBase(object):
     :return: n_out value
     :rtype: int
     """
-    n_out = cls._static_get_target_value(target=target, network=network, mark_data_key_as_used=False, get_layer=get_layer).dim
+    n_out = cls._static_get_target_value(
+      target=target, network=network, mark_data_key_as_used=False, get_layer=get_layer).dim
     if loss_class_name:
       n_out = get_loss_class(loss_class_name).get_auto_output_layer_dim(n_out)
     return n_out
@@ -4441,13 +4449,14 @@ class CombineLayer(LayerBase):
     """
     used_sources = set()  # type: set[int]
 
-    def source(i, auto_convert=True, enforce_batch_major=False):
+    def source(i, auto_convert=True, enforce_batch_major=False, as_data=False):
       """
       :param int i: layer index
       :param bool auto_convert:
       :param bool enforce_batch_major: if True, return as batch-major
+      :param bool as_data: if True, return the Data object
       :return: output placeholder from source i, compatible to source 0
-      :rtype: tf.Tensor
+      :rtype: tf.Tensor|Data
       """
       assert 0 <= i < len(sources)
       used_sources.add(i)
@@ -4457,7 +4466,10 @@ class CombineLayer(LayerBase):
           output = output.copy_compatible_to(sources[0].output)
         if enforce_batch_major:
           output = output.copy_as_batch_major()
+        if as_data:
+          return output
         return output.placeholder
+      assert not as_data
       return sources[i]
 
     vs = vars(TFUtil).copy()
@@ -5254,7 +5266,9 @@ class FramewiseStatisticsLayer(LayerBase):
 
 
 class PrintLayer(LayerBase):
-  """Prints the sources to console/log"""
+  """
+  Prints the sources to console/log, via :func:`tf.Print`.
+  """
   layer_class = "print"
 
   def __init__(self, **kwargs):
@@ -5266,19 +5280,74 @@ class PrintLayer(LayerBase):
       self.output.size_placeholder = source.output.size_placeholder.copy()
 
   @classmethod
-  def transform_config_dict(cls, d, network, get_layer):
+  def get_out_data_from_opts(cls, name, sources, **kwargs):
     """
-    :param dict[str] d: will modify inplace, the loss_opts
-    :param TFNetwork.TFNetwork network:
-    :param ((str) -> LayerBase) get_layer: function to get or construct another layer
+    :param str name:
+    :param list[LayerBase] sources:
+    :rtype: Data
     """
-    d["sources"] = [get_layer(d.pop("from"))]
+    assert len(sources) == 1, "PrintLayer %r: expects exactly one source, but got: %r" % (name, sources)
+    return sources[0].output.copy("%s_output" % name)
+
+
+class HDFDumpLayer(LayerBase):
+  """
+  Dumps into HDF file, compatible to :class:`HDFDataset`.
+  """
+  layer_class = "hdf_dump"
+
+  def __init__(self, filename, **kwargs):
+    """
+    :param str filename:
+    """
+    super(HDFDumpLayer, self).__init__(**kwargs)
+    self.output = self.sources[0].output.copy("%s_output" % self.name)
+    data = self.output.copy_as_batch_major()  # need batch-major for SimpleHDFWriter
+
+    from HDFDataset import SimpleHDFWriter
+    import atexit
+    self.filename = filename
+    self.num_seqs_written = 0
+    self.hdf_writer = SimpleHDFWriter(filename=filename, dim=data.dim, ndim=data.ndim)
+    atexit.register(self._at_exit)
+
+    def py_write(data_np, tags, *sizes):
+      """
+      :param numpy.ndarray data_np: (B,...), this is data.placeholder
+      :param list[str] tags:
+      :param sizes:
+      :return: unused
+      """
+      assert len(sizes) == len(data.size_placeholder)
+      assert len(tags) == data_np.shape[0]
+      self.num_seqs_written += data_np.shape[0]
+      self.hdf_writer.insert_batch(
+        inputs=data_np,
+        seq_tag=tags,
+        seq_len={i: size for (i, size) in zip(sorted(data.size_placeholder.keys()), sizes)})
+      return 0
+
+    tf_write = tf.py_func(
+      py_write,
+      [data.placeholder, self.network.get_seq_tags()] + [size for (i, size) in sorted(data.size_placeholder.items())],
+      tf.int64,
+      stateful=True)
+
+    self.network.register_post_control_dependencies([tf_write])
+
+  def _at_exit(self):
+    print("HDFDumpLayer, wrote %i seqs to file %r." % (self.num_seqs_written, self.filename))
+    self.hdf_writer.close()
 
   @classmethod
-  def get_out_data_from_opts(cls, **kwargs):
-    assert "n_out" not in kwargs, "Don't set n_out explicity in this layer"
-    kwargs["n_out"] = kwargs["sources"][0].output.dim
-    return super(PrintLayer, cls).get_out_data_from_opts(**kwargs)
+  def get_out_data_from_opts(cls, name, sources, **kwargs):
+    """
+    :param str name:
+    :param list[LayerBase] sources:
+    :rtype: Data
+    """
+    assert len(sources) == 1, "PrintLayer %r: expects exactly one source, but got: %r" % (name, sources)
+    return sources[0].output.copy("%s_output" % name)
 
 
 class ImageSummaryLayer(LayerBase):
@@ -5667,6 +5736,15 @@ class Loss(object):
     :rtype: int
     """
     return target_dim
+
+  @classmethod
+  def get_default_target(cls, extern_data):
+    """
+    :param TFNetwork.ExternData extern_data:
+    :return: default target name, or None if this loss does not have a target
+    :rtype: str|None
+    """
+    return extern_data.default_target
 
 
 class CrossEntropyLoss(Loss):
@@ -6550,6 +6628,11 @@ class AsIsLoss(Loss):
 
   def get_error(self):
     return None  # not defined
+
+  @classmethod
+  def get_default_target(cls, extern_data):
+    # We do not need any target.
+    return None
 
 
 class SamplingBasedLoss(Loss):
