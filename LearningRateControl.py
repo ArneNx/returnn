@@ -40,6 +40,7 @@ class LearningRateControl(object):
                          or config.value('learning_rate_control_error_measure', None),
       "relativeErrorAlsoRelativeToLearningRate": config.bool('learning_rate_control_relative_error_relative_lr', False),
       "minNumEpochsPerNewLearningRate": config.int("learning_rate_control_min_num_epochs_per_new_lr", 0),
+      "relativeErrorDivByOld": config.bool('newbob_relative_error_div_by_old', False),
       "filename": config.value('learning_rate_file', None),
     }
 
@@ -56,12 +57,14 @@ class LearningRateControl(object):
                errorMeasureKey=None,
                relativeErrorAlsoRelativeToLearningRate=False,
                minNumEpochsPerNewLearningRate=0,
+               relativeErrorDivByOld=False,
                filename=None):
     """
     :param float defaultLearningRate: default learning rate. usually for epoch 1
     :param list[float] | dict[int,float] defaultLearningRates: learning rates
     :param str|list[str]|None errorMeasureKey: for getEpochErrorValue() the selector for EpochData.error which is a dict
     :param int minNumEpochsPerNewLearningRate: if the lr was recently updated, use it for at least N epochs
+    :param bool relativeErrorDivByOld: if True, compute relative error as (new - old) / old.
     :param str filename: load from and save to file
     """
     self.epochData = {}  # type: dict[int,LearningRateControl.EpochData]
@@ -79,6 +82,7 @@ class LearningRateControl(object):
     self.errorMeasureKey = errorMeasureKey
     self.relativeErrorAlsoRelativeToLearningRate = relativeErrorAlsoRelativeToLearningRate
     self.minNumEpochsPerNewLearningRate = minNumEpochsPerNewLearningRate
+    self.relativeErrorDivByOld = relativeErrorDivByOld
     self.filename = filename
     if filename:
       if os.path.exists(filename):
@@ -109,7 +113,7 @@ class LearningRateControl(object):
     if self.minNumEpochsPerNewLearningRate > 1:
       lastLrs = [self.epochData[e].learningRate
                  for e in self._lastEpochsForEpoch(epoch, numEpochs=self.minNumEpochsPerNewLearningRate)]
-      if len(set(lastLrs)) >= 2:
+      if len(set(lastLrs)) >= 2 or 0 < len(lastLrs) < self.minNumEpochsPerNewLearningRate:
         return lastLrs[-1]
     learningRate = self.calcLearningRateForEpoch(epoch)
     if learningRate < self.minLearningRate:
@@ -166,7 +170,10 @@ class LearningRateControl(object):
       return None
     if oldKey != newKey:
       return None
-    relativeError = (newError - oldError) / abs(newError)
+    if self.relativeErrorDivByOld:
+      relativeError = (newError - oldError) / abs(oldError)
+    else:
+      relativeError = (newError - oldError) / abs(newError)
     if self.relativeErrorAlsoRelativeToLearningRate:
       learningRate = self.getMostRecentLearningRate(newEpoch, excludeCurrent=False)
       # If the learning rate is lower than the initial learning rate,

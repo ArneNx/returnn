@@ -1089,7 +1089,7 @@ def convert_data_dims(data_dims, leave_dict_as_is=False):
     assert len(v) == 2
     assert isinstance(v[0], int)
     assert isinstance(v[1], int)
-    assert 1 <= v[1] <= 2
+    assert 1 <= v[1]
   return data_dims
 
 
@@ -1127,7 +1127,7 @@ def shapes_for_batches(batches, data_keys, dataset=None, extern_data=None, enfor
       data_shape[extern_data.data[k].batch_dim_axis] = shape[1]
       if extern_data.data[k].have_time_axis():
         data_shape[extern_data.data[k].time_dim_axis] = shape[0][k]
-      assert all([n is not None for n in data_shape])
+      assert all([n is not None for n in data_shape]), "data %r" % extern_data.data[k]
       d[k] = data_shape
   else:  # shape via dataset
     d = {k: [shape[0][k], shape[1]] for k in all_data_keys}

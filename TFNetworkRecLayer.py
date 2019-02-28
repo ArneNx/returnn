@@ -797,6 +797,9 @@ class _SubnetworkRecCell(object):
     self.get_final_rec_vars = None
     self.accumulated_losses = {}  # type: dict[str,TFNetwork.LossHolder]
 
+  def __repr__(self):
+    return "<%s of %r>" % (self.__class__.__name__, self.parent_rec_layer)
+
   def _construct_template(self):
     """
     Without creating any computation graph, create TemplateLayer instances.
@@ -819,6 +822,7 @@ class _SubnetworkRecCell(object):
       layer_desc = layer_desc.copy()
       layer_desc["name"] = name
       layer_desc["network"] = self.net
+      layer.kwargs = layer_desc  # set it now already for better debugging
       output = layer_class.get_out_data_from_opts(**layer_desc)
       layer.init(layer_class=layer_class, output=output, **layer_desc)
       return layer
@@ -869,8 +873,9 @@ class _SubnetworkRecCell(object):
           sub_layer = root_layer.get_sub_layer('/'.join(name.split('/')[1:]))  # get the sub-layer from the root-layer
           if sub_layer:  # get_sub_layer returns None by default (if sub-layer not found)
             # add to templates so we will collect output in self.get_output if this is an output layer
-            self.layer_data_templates[name] = sub_layer
-            sub_layer.dependencies.add(root_layer)
+            if isinstance(sub_layer, _TemplateLayer):
+              self.layer_data_templates[name] = sub_layer
+              sub_layer.dependencies.add(root_layer)
             return sub_layer
         # Need to create layer instance here now to not run into recursive loops.
         # We will extend it later in add_templated_layer().
@@ -950,7 +955,13 @@ class _SubnetworkRecCell(object):
       print("%r: exception constructing template network (for deps and data shapes)" % self)
       from pprint import pprint
       print("Most recent construction stack:")
-      pprint(construct_ctx.most_recent)
+      if construct_ctx.most_recent:
+        for layer in construct_ctx.most_recent:
+          assert isinstance(layer, _TemplateLayer)
+          print("%r, kwargs:" % (layer,))
+          pprint(layer.kwargs)
+      else:
+        print(construct_ctx.most_recent)
       print("Template network so far:")
       pprint(self.layer_data_templates)
       raise
@@ -1121,7 +1132,7 @@ class _SubnetworkRecCell(object):
   def _get_init_extra_outputs(self, name):
     """
     :param str name: layer name
-    :rtype: tf.Tensor|tuple[tf.Tensor]
+    :rtype: dict[str,tf.Tensor]
     """
     template_layer = self.layer_data_templates[name]
     cl = template_layer.layer_class_type
@@ -2049,6 +2060,7 @@ class _SubnetworkRecCell(object):
 
     from TFNetwork import TFNetwork, ExternData
     from TFNetworkLayer import InternalLayer
+    from TFUtil import concat_with_opt_broadcast
     self.input_layers_net = TFNetwork(
       name="%s/%s:rec-subnet-input" % (self.parent_net.name, self.parent_rec_layer.name if self.parent_rec_layer else "?"),
       extern_data=ExternData(),
@@ -2075,7 +2087,8 @@ class _SubnetworkRecCell(object):
         initial = self._get_init_output(name)
         initial_wt = tf.expand_dims(initial, axis=0)  # add time axis
         x = output.placeholder
-        output.placeholder = tf.concat([initial_wt, x], axis=0, name="concat_in_time")
+        output.placeholder = concat_with_opt_broadcast(
+          [initial_wt, x], allow_broadcast=[True, False], axis=0, name="concat_in_time")
         output.placeholder = output.placeholder[:-1]  # remove last frame
         # Note: This seq_len might make sense to use here:
         # output.size_placeholder[0] = tf.minimum(output.size_placeholder[0] + 1, tf.shape(x)[0])
@@ -2119,7 +2132,7 @@ class _SubnetworkRecCell(object):
       return
 
     max_len = tf.reduce_max(seq_len) if seq_len is not None else None
-    from TFUtil import tensor_array_stack, has_control_flow_context
+    from TFUtil import tensor_array_stack, has_control_flow_context, concat_with_opt_broadcast
     from TFNetwork import TFNetwork, ExternData
     from TFNetworkLayer import InternalLayer
     self.output_layers_net = TFNetwork(
@@ -2176,7 +2189,8 @@ class _SubnetworkRecCell(object):
         initial = self._get_init_output(name)
         initial_wt = tf.expand_dims(initial, axis=0)  # add time axis
         x = output.placeholder
-        output.placeholder = tf.concat([initial_wt, x], axis=0, name="concat_in_time")
+        output.placeholder = concat_with_opt_broadcast(
+          [initial_wt, x], allow_broadcast=[True, False], axis=0, name="concat_in_time")
         output.placeholder = output.placeholder[:-1]  # remove last frame
         # Note: This seq_len might make sense to use here:
         # output.size_placeholder[0] = tf.minimum(output.size_placeholder[0] + 1, tf.shape(x)[0])

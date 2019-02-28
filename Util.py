@@ -439,6 +439,8 @@ def _pp_extra_info(obj, depth_limit=3):
   :return: extra info (if available: len, some items, ...)
   :rtype: str
   """
+  if isinstance(obj, np.ndarray):
+    return "shape=%r" % (obj.shape,)
   s = []
   if hasattr(obj, "__len__"):
     # noinspection PyBroadException
@@ -465,14 +467,54 @@ def _pp_extra_info(obj, depth_limit=3):
   return ", ".join(s)
 
 
-def pretty_print(obj):
+_pretty_print_limit = 300
+_pretty_print_as_bytes = False
+
+
+def set_pretty_print_default_limit(limit):
+  """
+  :param int|float limit: use float("inf") to disable
+  """
+  global _pretty_print_limit
+  _pretty_print_limit = limit
+
+
+def set_pretty_print_as_bytes(as_bytes):
+  """
+  :param bool as_bytes:
+  """
+  global _pretty_print_as_bytes
+  _pretty_print_as_bytes = as_bytes
+
+
+def pretty_print(obj, limit=None):
   """
   :param object obj:
+  :param int|float limit: use float("inf") to disable. None will use the default, via set_pretty_print_default_limit
   :return: repr(obj), or some shorted version of that, maybe with extra info
   :rtype: str
   """
-  s = repr(obj)
-  limit = 300
+  if _pretty_print_as_bytes and isinstance(obj, np.ndarray):
+    bs = obj.tobytes()
+    import gzip
+    bs = gzip.compress(bs)
+    import base64
+    if len(bs) > 57:
+      parts = []
+      while len(bs) > 0:
+        parts.append(bs[:57])
+        bs = bs[57:]
+        if len(bs) == 0:
+          break
+      s = "\n  " + "\n  ".join([repr(base64.encodebytes(bs).strip()) for bs in parts]) + "\n  "
+    else:
+      s = repr(base64.encodebytes(bs).strip())
+    s = "numpy.frombuffer(gzip.decompress(base64.decodebytes(%s)), dtype=%r).reshape(%r)" % (
+      s, str(obj.dtype), obj.shape)
+  else:
+    s = repr(obj)
+  if limit is None:
+    limit = _pretty_print_limit
   if len(s) > limit:
     s = s[:limit - 3]
     s += "..."

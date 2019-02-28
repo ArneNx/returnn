@@ -209,6 +209,168 @@ def test_combine_layer_net_construct():
     network.construct_from_dict(net_dict)
 
 
+def test_CombineLayer_two_time_dims():
+  with make_scope() as session:
+    n_dim = 5
+    n_batch = 3
+    n_time1 = 7
+    n_time2 = 11
+    rnd = numpy.random.RandomState(42)
+    net_dict = {
+      "output": {
+        "class": "combine", "kind": "add",
+        "from": ["data:in0", "data:in1", "data:in2"]}
+    }
+    config = Config({"debug_print_layer_output_template": True})
+    extern_data = ExternData()
+    in0 = Data(
+      name="in0", shape=(None, None, n_dim), batch_dim_axis=1, auto_create_placeholders=True)
+    in1 = Data(
+      # same time as first in in0
+      name="in1", shape=(None, n_dim), auto_create_placeholders=True)
+    in2 = Data(
+      # same time as in second in in0
+      name="in2", shape=(None, n_dim), batch_dim_axis=1, auto_create_placeholders=True)
+    extern_data.register_data(in0)
+    extern_data.register_data(in1)
+    extern_data.register_data(in2)
+    in1.get_size_dim_tag(0).declare_same_as(in0.get_size_dim_tag(0))
+    in2.get_size_dim_tag(0).declare_same_as(in0.get_size_dim_tag(1))
+    print("ExternData all dimension tags (allow_same_feature_dim=True):")
+    pprint(extern_data.get_all_dimension_tags(allow_same_feature_dim=True))
+    network = TFNetwork(config=config, extern_data=extern_data, train_flag=True)
+    network.construct_from_dict(net_dict)
+    output = network.get_default_output_layer().output
+    assert output.shape == (None, None, n_dim) and set(output.size_placeholder.keys()) == {0, 1}
+    assert output.batch_dim_axis == 1 and output.time_dim_axis == 0
+    time1_np = numpy.array([n_time1, n_time1 - 3, n_time1 - 2])
+    assert min(time1_np) > 0 and max(time1_np) == n_time1 and len(time1_np) == n_batch
+    time2_np = numpy.array([n_time2, n_time2 - 2, n_time2 - 5])
+    assert min(time2_np) > 0 and max(time2_np) == n_time2 and len(time2_np) == n_batch
+    in0_np = rnd.normal(size=(n_time1, n_batch, n_time2, n_dim)).astype("float32")
+    in1_np = rnd.normal(size=(n_batch, n_time1, n_dim)).astype("float32")
+    in2_np = rnd.normal(size=(n_time2, n_batch, n_dim)).astype("float32")
+    out_np, out_sizes_np = session.run(
+      fetches=(output.placeholder, output.size_placeholder),
+      feed_dict={
+        in0.placeholder: in0_np, in0.size_placeholder[0]: time1_np, in0.size_placeholder[1]: time2_np,
+        in1.placeholder: in1_np, in1.size_placeholder[0]: time1_np,
+        in2.placeholder: in2_np, in2.size_placeholder[0]: time2_np})
+    assert isinstance(out_np, numpy.ndarray)
+    assert isinstance(out_sizes_np, dict) and set(out_sizes_np.keys()) == {0, 1}
+    out_time0_np, out_time1_np = out_sizes_np[0], out_sizes_np[1]
+    assert isinstance(out_time0_np, numpy.ndarray) and isinstance(out_time1_np, numpy.ndarray)
+    assert out_np.shape == (n_time1, n_batch, n_time2, n_dim)
+
+
+def test_CombineLayer_two_time_dims_first_not_most_generic():
+  with make_scope() as session:
+    n_dim = 5
+    n_batch = 3
+    n_time1 = 7
+    n_time2 = 11
+    rnd = numpy.random.RandomState(42)
+    net_dict = {
+      "output": {
+        "class": "combine", "kind": "add",
+        "from": ["data:in1", "data:in0", "data:in2"]}
+    }
+    config = Config({"debug_print_layer_output_template": True})
+    extern_data = ExternData()
+    in0 = Data(
+      name="in0", shape=(None, None, n_dim), batch_dim_axis=1, auto_create_placeholders=True)
+    in1 = Data(
+      # same time as first in in0
+      name="in1", shape=(None, n_dim), auto_create_placeholders=True)
+    in2 = Data(
+      # same time as in second in in0
+      name="in2", shape=(None, n_dim), batch_dim_axis=1, auto_create_placeholders=True)
+    extern_data.register_data(in0)
+    extern_data.register_data(in1)
+    extern_data.register_data(in2)
+    in1.get_size_dim_tag(0).declare_same_as(in0.get_size_dim_tag(0))
+    in2.get_size_dim_tag(0).declare_same_as(in0.get_size_dim_tag(1))
+    print("ExternData all dimension tags (allow_same_feature_dim=True):")
+    pprint(extern_data.get_all_dimension_tags(allow_same_feature_dim=True))
+    network = TFNetwork(config=config, extern_data=extern_data, train_flag=True)
+    network.construct_from_dict(net_dict)
+    output = network.get_default_output_layer().output
+    assert output.shape == (None, None, n_dim) and set(output.size_placeholder.keys()) == {0, 1}
+    assert output.batch_dim_axis == 1 and output.time_dim_axis == 0
+    time1_np = numpy.array([n_time1, n_time1 - 3, n_time1 - 2])
+    assert min(time1_np) > 0 and max(time1_np) == n_time1 and len(time1_np) == n_batch
+    time2_np = numpy.array([n_time2, n_time2 - 2, n_time2 - 5])
+    assert min(time2_np) > 0 and max(time2_np) == n_time2 and len(time2_np) == n_batch
+    in0_np = rnd.normal(size=(n_time1, n_batch, n_time2, n_dim)).astype("float32")
+    in1_np = rnd.normal(size=(n_batch, n_time1, n_dim)).astype("float32")
+    in2_np = rnd.normal(size=(n_time2, n_batch, n_dim)).astype("float32")
+    out_np, out_sizes_np = session.run(
+      fetches=(output.placeholder, output.size_placeholder),
+      feed_dict={
+        in0.placeholder: in0_np, in0.size_placeholder[0]: time1_np, in0.size_placeholder[1]: time2_np,
+        in1.placeholder: in1_np, in1.size_placeholder[0]: time1_np,
+        in2.placeholder: in2_np, in2.size_placeholder[0]: time2_np})
+    assert isinstance(out_np, numpy.ndarray)
+    assert isinstance(out_sizes_np, dict) and set(out_sizes_np.keys()) == {0, 1}
+    out_time0_np, out_time1_np = out_sizes_np[0], out_sizes_np[1]
+    assert isinstance(out_time0_np, numpy.ndarray) and isinstance(out_time1_np, numpy.ndarray)
+    assert out_np.shape == (n_time1, n_batch, n_time2, n_dim)
+
+
+def test_CombineLayer_two_time_dims_first_not_most_generic_with_n_out():
+  with make_scope() as session:
+    n_dim = 5
+    n_batch = 3
+    n_time1 = 7
+    n_time2 = 11
+    rnd = numpy.random.RandomState(42)
+    net_dict = {
+      "output": {
+        "class": "combine", "kind": "add", "n_out": n_dim,
+        "from": ["data:in1", "data:in0", "data:in2"]}
+    }
+    config = Config({"debug_print_layer_output_template": True})
+    extern_data = ExternData()
+    in0 = Data(
+      name="in0", shape=(None, None, n_dim), batch_dim_axis=1, auto_create_placeholders=True)
+    in1 = Data(
+      # same time as first in in0
+      name="in1", shape=(None, n_dim), auto_create_placeholders=True)
+    in2 = Data(
+      # same time as in second in in0
+      name="in2", shape=(None, n_dim), batch_dim_axis=1, auto_create_placeholders=True)
+    extern_data.register_data(in0)
+    extern_data.register_data(in1)
+    extern_data.register_data(in2)
+    in1.get_size_dim_tag(0).declare_same_as(in0.get_size_dim_tag(0))
+    in2.get_size_dim_tag(0).declare_same_as(in0.get_size_dim_tag(1))
+    print("ExternData all dimension tags (allow_same_feature_dim=True):")
+    pprint(extern_data.get_all_dimension_tags(allow_same_feature_dim=True))
+    network = TFNetwork(config=config, extern_data=extern_data, train_flag=True)
+    network.construct_from_dict(net_dict)
+    output = network.get_default_output_layer().output
+    assert output.shape == (None, None, n_dim) and set(output.size_placeholder.keys()) == {0, 1}
+    assert output.batch_dim_axis == 1 and output.time_dim_axis == 0
+    time1_np = numpy.array([n_time1, n_time1 - 3, n_time1 - 2])
+    assert min(time1_np) > 0 and max(time1_np) == n_time1 and len(time1_np) == n_batch
+    time2_np = numpy.array([n_time2, n_time2 - 2, n_time2 - 5])
+    assert min(time2_np) > 0 and max(time2_np) == n_time2 and len(time2_np) == n_batch
+    in0_np = rnd.normal(size=(n_time1, n_batch, n_time2, n_dim)).astype("float32")
+    in1_np = rnd.normal(size=(n_batch, n_time1, n_dim)).astype("float32")
+    in2_np = rnd.normal(size=(n_time2, n_batch, n_dim)).astype("float32")
+    out_np, out_sizes_np = session.run(
+      fetches=(output.placeholder, output.size_placeholder),
+      feed_dict={
+        in0.placeholder: in0_np, in0.size_placeholder[0]: time1_np, in0.size_placeholder[1]: time2_np,
+        in1.placeholder: in1_np, in1.size_placeholder[0]: time1_np,
+        in2.placeholder: in2_np, in2.size_placeholder[0]: time2_np})
+    assert isinstance(out_np, numpy.ndarray)
+    assert isinstance(out_sizes_np, dict) and set(out_sizes_np.keys()) == {0, 1}
+    out_time0_np, out_time1_np = out_sizes_np[0], out_sizes_np[1]
+    assert isinstance(out_time0_np, numpy.ndarray) and isinstance(out_time1_np, numpy.ndarray)
+    assert out_np.shape == (n_time1, n_batch, n_time2, n_dim)
+
+
 def test_dropout_layer_net_construct():
   with make_scope() as session:
     net_dict = {
@@ -433,6 +595,17 @@ def test_MergeDimsLayer_batch_time_time_major_ext():
     assert layer.output.time_dim_axis == 1  # Note: This is currently the behavior, but maybe we change that.
 
 
+def test_MergeDimsLayer_except_time_ext():
+  with make_scope() as session:
+    n_batch = 11
+    n_time = 13
+    layer = _check_MergeDimsLayer(
+      session,
+      {"shape": (3, None, 5), "time_dim_axis": 2}, (n_batch, 3, n_time, 5),
+      {"axes": "except_time"}, (None, 15), (n_batch, n_time, 15))
+    assert layer.output.batch_dim_axis == 0 and layer.output.time_dim_axis == 1
+
+
 def test_MergeDimsLayer_SplitBatchTimeLayer_time_major():
   n_batch = 3
   n_time = 4
@@ -642,6 +815,52 @@ def test_SliceLayer_output_placeholder():
        [7, 9],
        [12, 14]])
     assert_equal(seq_lens.tolist(), [2, 1, 1])
+
+
+def test_SliceLayer_NCHW():
+  with make_scope() as session:
+    import numpy as np
+    net = TFNetwork(extern_data=ExternData())
+    with tf.variable_scope("src_nchw"):
+      src_nchw = InternalLayer(name="src_nchw", network=net, out_type={"dim": 16,
+                                                                       "shape": (16, None, 16),
+                                                                       "batch_dim_axis": 0,
+                                                                       "time_dim_axis": 2,
+                                                                       "feature_dim_axis": 1,
+                                                                       "sparse": False
+                                                                       })
+      src_nchw.output.placeholder = tf.placeholder(shape=(None, 16, None, 16), dtype=tf.float32)
+      src_nchw.output.size_placeholder = {1: tf.placeholder(shape=(None,), dtype=tf.int32)}
+    with tf.variable_scope("src_nchw_feature_unspecified"):
+      src_nchw_no_f = InternalLayer(name="src_nchw_feature_unspecified", network=net, out_type={"dim": 16,
+                                                                                                "shape": (16, None, 16),
+                                                                                                "batch_dim_axis": 0,
+                                                                                                "time_dim_axis": 2,
+                                                                                                "feature_dim_axis": NotSpecified,
+                                                                                                "sparse": False
+                                                                                                })
+      src_nchw_no_f.output.placeholder = tf.placeholder(shape=(None, 16, None, 16), dtype=tf.float32)
+      src_nchw_no_f.output.size_placeholder = {1: tf.placeholder(shape=(None,), dtype=tf.int32)}
+    with tf.variable_scope("slice1"):
+      slice1 = SliceLayer(
+        name="slice1", network=net, axis="f", slice_step=2, sources=[src_nchw],
+        output=SliceLayer.get_out_data_from_opts(name="slice1", axis="f", slice_step=2,
+                                                 sources=[src_nchw]))
+    with tf.variable_scope("slice2"):
+      slice2 = SliceLayer(
+        name="slice2", network=net, axis="f", slice_step=2, sources=[src_nchw_no_f],
+        output=SliceLayer.get_out_data_from_opts(name="slice2", axis="f", slice_step=2,
+                                                 sources=[src_nchw_no_f]))
+    out1, out2 = session.run([slice1.output.placeholder, slice2.output.placeholder],
+                             feed_dict={src_nchw.output.placeholder: np.random.rand(10, 16, 11, 16),
+                                        src_nchw.output.size_placeholder[1]: np.full(shape=(10,), fill_value=11),
+                                        src_nchw_no_f.output.placeholder: np.random.rand(10, 16, 11, 16),
+                                        src_nchw_no_f.output.size_placeholder[1]: np.full(shape=(10,), fill_value=11)
+                                        })
+    assert out1.shape == (10, 8, 11, 16)
+    assert slice1.output.dim == 8 and slice1.output.feature_dim_axis == 1
+    assert out2.shape == (10, 16, 11, 8)
+    assert slice2.output.dim == 8 and slice2.output.feature_dim_axis == 3
 
 
 def test_WindowLayer_output_placeholder():
@@ -933,6 +1152,82 @@ def test_pool_layer_NCHW():
     print(out.shape)
     assert_equal(out.shape, (10, 7, 6, 16))
     print(seq_lens)
+
+
+def test_ReduceLayer_NCHW():
+  with make_scope() as session:
+    import numpy as np
+    net = TFNetwork(extern_data=ExternData())
+    with tf.variable_scope("src_nchw"):
+      src_nchw = InternalLayer(name="src_nchw", network=net, out_type={"dim": 16,
+                                                                       "shape": (16, None, 16),
+                                                                       "batch_dim_axis": 0,
+                                                                       "time_dim_axis": 2,
+                                                                       "feature_dim_axis": 1,
+                                                                       "sparse": False
+                                                                       })
+      src_nchw.output.placeholder = tf.placeholder(shape=(None, 16, None, 16), dtype=tf.float32)
+      src_nchw.output.size_placeholder = {1: tf.placeholder(shape=(None,), dtype=tf.int32)}
+    with tf.variable_scope("reduce1"):
+      reduce1 = ReduceLayer(
+        name="reduce1", network=net, mode="max", axis="f", sources=[src_nchw],
+        output=ReduceLayer.get_out_data_from_opts(name="reduce1", mode="max", axis="f",
+                                                  sources=[src_nchw]))
+    with tf.variable_scope("reduce2"):
+      reduce2 = ReduceLayer(
+        name="reduce2", network=net, mode="max", axis="b", sources=[src_nchw],
+        output=ReduceLayer.get_out_data_from_opts(name="reduce2", mode="max", axis="b",
+                                                  sources=[src_nchw]))
+    out1, out2 = session.run([reduce1.output.placeholder, reduce2.output.placeholder],
+                             feed_dict={src_nchw.output.placeholder: np.random.rand(10, 16, 11, 16),
+                                        src_nchw.output.size_placeholder[1]: np.full(shape=(10,), fill_value=11)})
+    assert_equal(out1.shape, (10, 11, 16))
+    assert_equal(out2.shape, (16, 11, 16))
+    assert reduce1.output.feature_dim_axis is None and reduce1.output.dim is None
+    assert reduce1.output.time_dim_axis == 1
+    assert reduce2.output.feature_dim_axis == 0 and reduce2.output.dim == 16
+    assert reduce2.output.batch_dim_axis is None
+
+
+def test_Loss_NCHW():
+  with make_scope() as session:
+    import numpy as np
+    net = TFNetwork(extern_data=ExternData())
+    with tf.variable_scope("src_nchw"):
+      src_nchw = InternalLayer(name="src_nchw", network=net, out_type={"dim": 16,
+                                                                       "shape": (16, None),
+                                                                       "batch_dim_axis": 0,
+                                                                       "time_dim_axis": 2,
+                                                                       "feature_dim_axis": 1,
+                                                                       "sparse": False
+                                                                       })
+      src_nchw.output.placeholder = tf.placeholder(shape=(None, 16, None), dtype=tf.float32)
+      src_nchw.output.size_placeholder = {1: tf.placeholder(shape=(None,), dtype=tf.int32)}
+
+    with tf.variable_scope("activation"):
+      activation = ActivationLayer(name="activation", activation="softmax", network=net, sources=[src_nchw])
+
+    target_placeholder = tf.placeholder(shape=(None, None, 16), dtype=tf.float32)
+    target_size_placeholder = tf.placeholder(shape=(None,), dtype=tf.int32)
+    target_data = Data(name="target", shape=(None, 16), placeholder=target_placeholder,
+                       size_placeholder={0: target_size_placeholder},
+                       time_dim_axis=1, feature_dim_axis=2)
+
+    with tf.variable_scope("loss"):
+      loss = CrossEntropyLoss(base_network=net)
+      loss.init(output=activation.output, output_with_activation=activation.output_before_activation,
+                target=target_data, layer=activation)
+
+    random_input = np.random.rand(10, 16, 32)
+    loss_out, out_flat = session.run([loss.get_value(), loss.output_before_softmax_flat],
+                                     feed_dict={src_nchw.output.placeholder: random_input,
+                                                src_nchw.output.size_placeholder[1]: np.full(shape=(10,), fill_value=32),
+                                                target_placeholder: np.random.rand(10, 32, 16),
+                                                target_size_placeholder: np.full(shape=(10,), fill_value=32)
+                                                })
+    print(loss_out)
+    assert loss.output.feature_dim_axis == 2
+    assert out_flat.shape == (320, 16)
 
 
 def test_ResizeLayer_fill_value():

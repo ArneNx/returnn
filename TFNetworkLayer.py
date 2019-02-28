@@ -278,15 +278,17 @@ class LayerBase(object):
     # However, in many cases, this will just be {0: time-lengths} and the same as from the input.
     # We check for this case and preset it by that if possible.
     # If you want to have it different in your layer, just overwrite it.
-    if sources and sources[0].output.matches_var_dim_pattern(output):
-      output.size_placeholder = sources[0].output.size_placeholder.copy()
-    elif target or size_target:
-      if network.train_flag is not False:
-        # TODO: In training, this is ok. Maybe as well as for eval but not clear.
-        # In forward, mark_data_key_as_used=False should be used and anyway that target value is not available.
-        output.size_placeholder = cls._static_get_target_value(
-          target=target or size_target, network=network,
-          mark_data_key_as_used=network.train_flag is not False).size_placeholder.copy()
+    common_source = Data.get_common_data([s.output for s in sources])
+    if not output.size_placeholder:
+      if sources and common_source.matches_var_dim_pattern(output):
+        output.size_placeholder = common_source.size_placeholder.copy()
+      elif target or size_target:
+        if network.train_flag is not False:
+          # TODO: In training, this is ok. Maybe as well as for eval but not clear.
+          # In forward, mark_data_key_as_used=False should be used and anyway that target value is not available.
+          output.size_placeholder = cls._static_get_target_value(
+            target=target or size_target, network=network,
+            mark_data_key_as_used=network.train_flag is not False).size_placeholder.copy()
     if any([(src and not src.output.available_for_inference) for src in sources]):
       output.available_for_inference = False
 
@@ -995,8 +997,10 @@ class LayerBase(object):
     if v is None:
       v = "zeros"
     bc_shape = [(d if (d is not None) else 1) for d in data.batch_shape]
-    # Some other code might not support automatic broadcasting in the batch-axis. (Example: concat_in_time)
-    # Thus we will automatically
+    # Some other code might not support automatic broadcasting in the batch-axis. (Earlier example: concat_in_time)
+    # Thus we will automatically unbroadcast here (at least the batch axis).
+    # Note that there still might be other axes which we do not unbroadcast here.
+    # Thus, concat_in_time was fixed now, and maybe we actually do not need this anymore.
     shape = list(bc_shape)
     shape[data.batch_dim_axis] = batch_dim
     if isinstance(v, (float, int)):
@@ -1528,16 +1532,18 @@ def concat_sources(src_layers):
   if cache_key in network.concat_sources_dropout_cache:
     return network.concat_sources_dropout_cache[cache_key].copy()
   data = get_concat_sources_data_template(src_layers)
+  common_source = Data.get_common_data([s.output for s in src_layers])
+  # Currently we assume that get_concat_sources_data_template will match Data.get_common_data (besides the dim).
+  data.size_placeholder = common_source.size_placeholder.copy()  # to get right dimension tags
   layers_data = []
   with _name_scope_for_concat_src_layers(src_layers, "concat_sources"):
     data_dyn_shape = list(data.batch_shape)
     if any([d is None for d in data_dyn_shape]):
-      # Currently we assume that get_concat_sources_data_template will match the first layer,
-      # and thus the first layer output shape should be correct.
-      assert src_layers[0].output.batch_ndim == data.batch_ndim
+      # Currently we assume that get_concat_sources_data_template will match Data.get_common_data (besides the dim).
+      assert common_source.batch_ndim == data.batch_ndim
       for axis in range(data.batch_ndim):
         if data_dyn_shape[axis] is None:
-          data_dyn_shape[axis] = tf.shape(src_layers[0].output.placeholder)[axis]
+          data_dyn_shape[axis] = tf.shape(common_source.placeholder)[axis]
     for layer in src_layers:
       assert not layer.output.sparse, "sparse concat not supported"
       assert layer.output.dtype == data.dtype, "incompatible dtype with layer %r" % layer
@@ -1546,7 +1552,6 @@ def concat_sources(src_layers):
     data.placeholder = tf.concat(
       axis=data.feature_dim_axis,
       values=[l.placeholder for l in layers_data])
-  data.size_placeholder = src_layers[0].output.size_placeholder.copy()
   network.concat_sources_dropout_cache[cache_key] = data.copy()
   return data
 
@@ -1555,7 +1560,7 @@ def get_concat_sources_data_template(src_layers, name=None):
   """
   This just creates a template :class:`Data` instance,
   without creating any real TF tensors.
-  :func:`conact_sources` (and related) are the equivalent functions
+  :func:`concat_sources` (and related) are the equivalent functions
   which would create a :class:`Data` together with the tensor.
 
   :param list[LayerBase] src_layers:
@@ -1568,6 +1573,7 @@ def get_concat_sources_data_template(src_layers, name=None):
     return src_layers[0].output.copy(name=name)
   dim = 0
   beam_size = None
+  common_source = Data.get_common_data([s.output for s in src_layers])
   for layer in src_layers:
     # Note: We do not perform much compatibility checks at this point,
     # as this is for a template only anyway.
@@ -1576,16 +1582,16 @@ def get_concat_sources_data_template(src_layers, name=None):
     assert layer.output.dim is not None
     dim += layer.output.dim
     beam_size = beam_size or layer.output.beam_size
-  data = Data(
+  shape = list(common_source.shape)
+  shape[common_source.get_batch_axis_excluding_batch(common_source.feature_dim_axis)] = dim
+  kwargs = common_source.get_kwargs()
+  kwargs.update(dict(
     name=name or ("concat_" + "_".join([l.name for l in src_layers])),
-    shape=src_layers[0].output.shape[:-1] + (dim,),
+    shape=shape,
     dim=dim,
     sparse=False,
-    batch_dim_axis=src_layers[0].output.batch_dim_axis,
-    time_dim_axis=src_layers[0].output.time_dim_axis,
-    feature_dim_axis=src_layers[0].output.feature_dim_axis_or_unspecified,
-    dtype=src_layers[0].output.dtype,
-    beam_size=beam_size)
+    beam_size=beam_size))
+  data = Data(**kwargs)
   return data
 
 
@@ -1941,9 +1947,9 @@ class SliceLayer(_ConcatInputLayer):
       out_type["shape"] = list(out_type["shape"])
       if out_type["shape"][axis_wo_batch] is not None:
         out_type["shape"][axis_wo_batch] = len(range(out_type["shape"][axis_wo_batch])[dim_slice])
-      if axis_wo_batch == len(out_type["shape"]) - 1 and not out_type["sparse"]:
-        assert out_type["shape"][axis_wo_batch]
-        out_type["dim"] = out_type["shape"][axis_wo_batch]
+    if not out_type["sparse"]:
+      # Let Data() automatically infer "dim".
+      out_type["dim"] = NotSpecified
     return Data(**out_type)
 
 
@@ -3590,6 +3596,8 @@ class ReduceLayer(_ConcatInputLayer):
     axes = cls.get_axes(axis=axes, input_data=x)
     y_shape = list(x.batch_shape)
     out_batch_dim_axis = x.batch_dim_axis
+    out_feature_dim_axis = x.feature_dim_axis_or_unspecified
+    out_time_dim_axis = x.time_dim_axis
     if keep_dims:
       for i in axes:
         y_shape[i] = 1
@@ -3597,14 +3605,25 @@ class ReduceLayer(_ConcatInputLayer):
     else:
       if out_batch_dim_axis in axes:
         out_batch_dim_axis = None
+      if out_time_dim_axis in axes:
+        out_time_dim_axis = None
+      if out_feature_dim_axis in axes:
+        out_feature_dim_axis = None
       for i in reversed(sorted(set(axes + [x.batch_dim_axis] if x.batch_dim_axis is not None else []))):
         del y_shape[i]
+      for i in reversed(sorted(set(axes))):
         if out_batch_dim_axis and i < out_batch_dim_axis:
           out_batch_dim_axis -= 1
+        if out_time_dim_axis and i < out_time_dim_axis:
+          out_time_dim_axis -= 1
+        if out_feature_dim_axis and out_feature_dim_axis is not NotSpecified and i < out_feature_dim_axis:
+          out_feature_dim_axis -= 1
     return Data(
       name="%s_output" % name,
       shape=y_shape,
       batch_dim_axis=out_batch_dim_axis,
+      time_dim_axis=out_time_dim_axis,
+      feature_dim_axis=out_feature_dim_axis,
       dtype=x.dtype,
       sparse=False,
       beam_size=x.beam_size)
@@ -4354,8 +4373,8 @@ class CombineLayer(LayerBase):
     """
     assert sources
     super(CombineLayer, self).__init__(sources=sources, **kwargs)
-    assert kind in ["average", "add", "sub", "mul", "eval"], \
-        "Invalid `kind` %r for this layer." % kind
+    assert kind in ["average", "add", "sub", "mul", "eval"], (
+      "%s: Invalid `kind` %r for this layer." % (self, kind))
     op = self._get_op(kind=kind, eval_str=eval, eval_locals=eval_locals)
     x = op(sources)
     if eval_for_output_loss:
@@ -4381,10 +4400,20 @@ class CombineLayer(LayerBase):
 
   @classmethod
   def get_out_data_from_opts(cls, n_out=None, out_type=None, sources=(), **kwargs):
-    if not n_out and not out_type:
-      out_type = sources[0].output.get_kwargs()
-      out_type["name"] = "%s_output" % kwargs["name"]
-    return super(CombineLayer, cls).get_out_data_from_opts(n_out=n_out, out_type=out_type, sources=sources, **kwargs)
+    out_type_ = {}
+    if sources:
+      out_type_.update(Data.get_common_data([s.output for s in sources]).get_kwargs())
+    if n_out:
+      out_type_["dim"] = n_out
+    out_type_.setdefault("name", "%s_output" % kwargs["name"])
+    if out_type:
+      if isinstance(out_type, dict):
+        out_type_.update(out_type)
+      elif callable(out_type):
+        out_type_ = out_type  # just overwrite
+      else:
+        raise TypeError("unexpected type of out_type %r" % (out_type,))
+    return super(CombineLayer, cls).get_out_data_from_opts(n_out=n_out, out_type=out_type_, sources=sources, **kwargs)
 
   def _check_same_dense_dim(self, sources):
     """
@@ -4393,8 +4422,8 @@ class CombineLayer(LayerBase):
     assert not self.output.sparse
     for source in sources:
       assert not source.output.sparse
-      assert source.output.dim == self.output.dim \
-              or source.output.dim == 1 # Constant layer broadcasting
+      assert (source.output.dim == self.output.dim
+              or source.output.dim == 1)  # constant layer broadcasting
 
   # Requires the same input shape and yield the same output shape.
   def _op_dense_fn(self, sources, fn):
@@ -4404,9 +4433,10 @@ class CombineLayer(LayerBase):
     :rtype: tf.Tensor
     """
     self._check_same_dense_dim(sources)
-    x = sources[0].output.placeholder
+    common_data = Data.get_common_data([s.output for s in sources])
+    x = sources[0].output.copy_compatible_to(common_data).placeholder
     for source in sources[1:]:
-      x2 = source.output.copy_compatible_to(sources[0].output).placeholder
+      x2 = source.output.copy_compatible_to(common_data).placeholder
       x = fn(x, x2)
     return x
 
@@ -4448,6 +4478,7 @@ class CombineLayer(LayerBase):
     :rtype: tf.Tensor
     """
     used_sources = set()  # type: set[int]
+    common_data = Data.get_common_data([s.output for s in sources])
 
     def source(i, auto_convert=True, enforce_batch_major=False, as_data=False):
       """
@@ -4462,8 +4493,8 @@ class CombineLayer(LayerBase):
       used_sources.add(i)
       if isinstance(sources[i], LayerBase):
         output = sources[i].output
-        if auto_convert and i != 0:
-          output = output.copy_compatible_to(sources[0].output)
+        if auto_convert:
+          output = output.copy_compatible_to(common_data)
         if enforce_batch_major:
           output = output.copy_as_batch_major()
         if as_data:
@@ -4484,6 +4515,7 @@ class CombineLayer(LayerBase):
     op = getattr(self, "_op_kind_%s" % kind)
     if eval_str:
       assert kind == "eval"
+
       def wrap_eval_op(sources):
         return self._op_kind_eval(sources, eval_str=eval_str, eval_locals=eval_locals)
       op = wrap_eval_op
@@ -5293,12 +5325,16 @@ class PrintLayer(LayerBase):
 class HDFDumpLayer(LayerBase):
   """
   Dumps into HDF file, compatible to :class:`HDFDataset`.
+
+  Common usage would be to add this to your network with "is_output_layer": True,
+  such that you don't need to make other layers depend on it.
   """
   layer_class = "hdf_dump"
 
-  def __init__(self, filename, **kwargs):
+  def __init__(self, filename, dump_whole_batches=False, **kwargs):
     """
     :param str filename:
+    :param bool dump_whole_batches: dumps the whole batch as a single sequence into the HDF
     """
     super(HDFDumpLayer, self).__init__(**kwargs)
     self.output = self.sources[0].output.copy("%s_output" % self.name)
@@ -5306,26 +5342,51 @@ class HDFDumpLayer(LayerBase):
 
     from HDFDataset import SimpleHDFWriter
     import atexit
+    import numpy
+    import sys
     self.filename = filename
+    self.dump_whole_batches = dump_whole_batches
     self.num_seqs_written = 0
-    self.hdf_writer = SimpleHDFWriter(filename=filename, dim=data.dim, ndim=data.ndim)
+    ndim = data.ndim
+    if dump_whole_batches:
+      ndim = data.ndim - len(data.size_placeholder) + 1
+    self.hdf_writer = SimpleHDFWriter(filename=filename, dim=data.dim, ndim=ndim)
     atexit.register(self._at_exit)
 
     def py_write(data_np, tags, *sizes):
       """
       :param numpy.ndarray data_np: (B,...), this is data.placeholder
-      :param list[str] tags:
+      :param list[bytes] tags:
       :param sizes:
       :return: unused
       """
-      assert len(sizes) == len(data.size_placeholder)
-      assert len(tags) == data_np.shape[0]
-      self.num_seqs_written += data_np.shape[0]
-      self.hdf_writer.insert_batch(
-        inputs=data_np,
-        seq_tag=tags,
-        seq_len={i: size for (i, size) in zip(sorted(data.size_placeholder.keys()), sizes)})
-      return 0
+      # noinspection PyBroadException
+      try:
+        n_batch = data_np.shape[0]
+        assert len(sizes) == len(data.size_placeholder)
+        seq_lens = {i: size for (i, size) in zip(sorted(data.size_placeholder.keys()), sizes)}
+        extra = {}
+        if self.dump_whole_batches:
+          # The batch dim itself becomes another axis to dump.
+          # We also want to store the individual seq lens.
+          batch_seq_sizes = numpy.zeros((1, n_batch, len(seq_lens)), dtype="int32")
+          for i, (axis, size) in enumerate(sorted(seq_lens.items())):
+            batch_seq_sizes[0, :, i] = seq_lens[axis]
+          extra["seq_sizes"] = batch_seq_sizes
+          assert sorted(seq_lens.keys()) == list(range(len(seq_lens)))
+          flat_len = numpy.prod(data_np.shape[:len(seq_lens) + 1])
+          data_np = data_np.reshape((1, flat_len) + data_np.shape[len(seq_lens) + 1:])
+          seq_lens = {0: numpy.array([flat_len], dtype="int32")}
+          tags = [b"<->".join(tags)]
+          n_batch = 1
+        assert n_batch == data_np.shape[0] == len(tags)
+        self.num_seqs_written += n_batch
+        self.hdf_writer.insert_batch(inputs=data_np, seq_tag=tags, seq_len=seq_lens, extra=extra)
+        return 0
+      # TF does not print the stacktrace, so we do it instead.
+      except Exception:
+        sys.excepthook(*sys.exc_info())
+        raise
 
     tf_write = tf.py_func(
       py_write,
@@ -5634,6 +5695,13 @@ class Loss(object):
             target = target.copy_extend_with_beam(output.beam_size)
         else:
           assert not target.beam_size
+      if output.feature_dim_axis is not None and output.feature_dim_axis != output.batch_ndim - 1:
+        if output_with_activation:
+          from TFUtil import move_axis
+          output_with_activation = OutputWithActivation(x=move_axis(output_with_activation.x,
+                                                                    output.feature_dim_axis, -1),
+                                                        act_func=output_with_activation.act_func)
+        output = output.copy_with_feature_dim_axis(-1)
       self.output = output
       self.output_with_activation = output_with_activation
       self.target = target

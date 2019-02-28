@@ -8,7 +8,9 @@ import contextlib
 import os
 import sys
 import threading
-from Util import NotSpecified, NativeCodeCompiler
+from Util import NotSpecified, NativeCodeCompiler, PY3
+if PY3:
+  import typing
 
 
 class CollectionKeys:
@@ -77,11 +79,12 @@ class DimensionTag(object):
     :param int|None dimension:
     :param tf.Tensor|None dyn_size: e.g. seq_len, (batch,)
     """
-    self.id = id(self)
+    self.id = id(self)  # This is just used for __repr__ to distinguish different instances.
     self.kind = kind
     self.description = description
     self.dimension = dimension
     self.dyn_size = dyn_size
+    self.same_as = None  # type: DimensionTag
 
   def __repr__(self):
     attribs = ["kind"]
@@ -89,6 +92,8 @@ class DimensionTag(object):
       if getattr(self, attr) is not None:
         attribs.append(attr)
     attribs.append("id")
+    if self.same_as:
+      attribs.append("same_base_id")
     return "DimensionTag(%s)" % ", ".join(["%s=%r" % (attr, getattr(self, attr)) for attr in attribs])
 
   def set_tag_on_size_tensor(self, x):
@@ -110,6 +115,103 @@ class DimensionTag(object):
     :rtype: DimensionTag|None
     """
     return getattr(x, "_is_size_of_dim_tag", None)
+
+  def is_equal(self, other, allow_same_feature_dim=False):
+    """
+    :param DimensionTag other:
+    :param bool allow_same_feature_dim:
+    :rtype: bool
+    """
+    self_base = self.get_same_base()
+    other_base = other.get_same_base()
+    if self_base is other_base:
+      return True
+    if self.dimension != other.dimension:
+      return False
+    if self.kind != other.kind:
+      return False
+    if self.kind == other.kind == self.Types.Batch:
+      # Note: This might be incorrect in some cases,
+      # e.g. for beam search when we have the beam hidden in the batch dim,
+      # or when we used MergeDimsLayer on the batch axis, or so.
+      # We might need to extend the logic here later.
+      return True
+    if self.kind == other.kind == self.Types.Feature:
+      if allow_same_feature_dim:
+        return True
+    if self.kind == other.kind == self.Types.Spatial:
+      if self.dimension is not None and allow_same_feature_dim:
+        return True
+    if self.description == other.description:
+      return True
+    return False
+
+  def __eq__(self, other):
+    """
+    :param DimensionTag other:
+    :rtype: bool
+    """
+    return self.is_equal(other)
+
+  def __ne__(self, other):
+    """
+    :param DimensionTag other:
+    :rtype: bool
+    """
+    return not (self == other)
+
+  def get_same_base(self):
+    """
+    :rtype: DimensionTag
+    """
+    if self.same_as:
+      return self.same_as.get_same_base()
+    return self
+
+  @property
+  def same_base_id(self):
+    """
+    :rtype: int
+    """
+    return self.get_same_base().id
+
+  def declare_same_as(self, other):
+    """
+    :param DimensionTag other:
+    """
+    assert not self.same_as
+    self.same_as = other.get_same_base()
+
+  @classmethod
+  def get_all_dimension_tags(cls, data_list, allow_same_feature_dim):
+    """
+    :param list[Data] data_list:
+    :param bool allow_same_feature_dim:
+    :return: list of dimension tags, dict for data -> list of dimension tags (for each axis)
+    :rtype: (list[DimensionTag], dict[Data, list[DimensionTag]])
+    """
+    tags = []
+
+    def get_existing_tag(other):
+      """
+      :param DimensionTag other:
+      :rtype: DimensionTag|None
+      """
+      for _tag in tags:
+        if _tag.is_equal(other, allow_same_feature_dim=allow_same_feature_dim):
+          return _tag
+      return None
+
+    data_axes_dict = {}
+    for data in data_list:
+      data_axes_dict[data] = []
+      for axis in range(data.batch_ndim):
+        tag = data.get_dim_tag(axis)
+        existing_tag = get_existing_tag(tag)
+        if not existing_tag:
+          tags.append(tag)
+        data_axes_dict[data].append(existing_tag or tag)
+    return tags, data_axes_dict
 
 
 class Data(object):
@@ -211,9 +313,13 @@ class Data(object):
       if self.batch_dim_axis is None:
         time_dim_axis = None
       else:
+        # Do not select the batch dim axis, or any axis with None dim.
+        # Note that we currently allow to select the same as the feature dim axis,
+        # in case the feature dim is None.
         taken_axes = {self.batch_dim_axis}
-        if self.feature_dim_axis is not None and self.batch_shape[self.feature_dim_axis] is not None:
-          taken_axes.add(self.feature_dim_axis)
+        for axis, _dim in enumerate(self.batch_shape):
+          if _dim is not None:
+            taken_axes.add(axis)
         available_axes = [i for i in range(self.batch_ndim) if i not in taken_axes]
         if available_axes:
           time_dim_axis = available_axes[0]
@@ -331,6 +437,9 @@ class Data(object):
 
   def __repr__(self):
     return self.get_description()
+
+  def __hash__(self):
+    return id(self)
 
   def copy(self, name=None):
     """
@@ -600,6 +709,7 @@ class Data(object):
     """
     assert self.sparse == data.sparse
     assert self.dtype == data.dtype
+    _, dim_tags = DimensionTag.get_all_dimension_tags([self, data], allow_same_feature_dim=True)
     v = self.copy()
     # Add feature dim, if needed.
     if data.feature_dim_axis is not None and v.feature_dim_axis is None:
@@ -607,6 +717,8 @@ class Data(object):
     # Add spatial dims, in case we miss any.
     for axis in data.get_spatial_batch_axes():
       if len(data.get_spatial_batch_axes()) > len(v.get_spatial_batch_axes()):
+        if dim_tags[data][axis] in dim_tags[self]:
+          continue  # This one seems to exist already, add the next one.
         axis_wo_batch = data.get_batch_axis_excluding_batch(axis)
         v = v.copy_add_spatial_dim(v.get_batch_axis(axis_wo_batch))
     assert data.get_spatial_axes() == v.get_spatial_axes()
@@ -696,6 +808,45 @@ class Data(object):
       data.beam_size = beam_size * (data.beam_size or 1)
       return data
 
+  def copy_squeeze_axes(self, axes):
+    """
+    :param list[int] axes: counted with batch dim
+    :return: copy of myself, with squeezed axes
+    :rtype: Data
+    """
+    assert isinstance(axes, (list, tuple))
+    assert all([self.batch_shape[axis] == 1 for axis in axes])
+    if not axes:
+      return self.copy()
+    data = self.copy()
+    if data.placeholder is not None:
+      data.placeholder = tf.squeeze(
+        data.placeholder, axes,
+        name="%s_squeeze_axes" % get_valid_scope_name_from_str(data.name))
+    assert data.batch_dim_axis not in axes
+    data.shape = tuple([data.shape[i] for i in range(data.ndim) if data.get_batch_axis(i) not in axes])
+    if self.time_dim_axis is not None:
+      if self.time_dim_axis in axes:
+        data.time_dim_axis = None
+      else:
+        data.time_dim_axis = self.time_dim_axis - len([axis for axis in axes if axis < self.time_dim_axis])
+    if self.feature_dim_axis is not None and self.feature_dim_axis_or_unspecified is not NotSpecified:
+      if self.feature_dim_axis in axes:
+        data.feature_dim_axis = None
+      else:
+        data.feature_dim_axis = self.feature_dim_axis - len([axis for axis in axes if axis < self.feature_dim_axis])
+    if data.feature_dim_axis != self.feature_dim_axis:
+      if data.feature_dim_axis is not None:
+        data.dim = data.batch_shape[data.feature_dim_axis]
+      else:
+        data.dim = None
+    if self.size_placeholder:
+      data.size_placeholder = {
+        i - len([axis for axis in axes if self.get_batch_axis_excluding_batch(axis) < i]): size
+        for (i, size) in self.size_placeholder.items()}
+    data.sanity_check()
+    return data
+
   def copy_template(self, name=None):
     """
     :return: copy of myself, using self.get_kwargs(), without placeholder
@@ -761,7 +912,7 @@ class Data(object):
     other_special_axes.pop("time_dim_axis", None)
     for axis_name, axis in other_special_axes.items():
       kwargs[axis_name] = axis if (axis < self.time_dim_axis) else (axis - 1)
-    kwargs["time_dim_axis"] = None
+    del kwargs["time_dim_axis"]  # maybe automatically select another one
     kwargs["shape"] = new_shape
     if name:
       kwargs["name"] = name
@@ -1093,8 +1244,8 @@ class Data(object):
       elif axes == "except_time":  # also except batch
         axes = list(range(self.batch_ndim))
         axes.remove(self.batch_dim_axis)
-        assert self.time_dim_axis is not None
-        axes.remove(self.time_dim_axis)
+        if self.time_dim_axis is not None:
+          axes.remove(self.time_dim_axis)
       elif axes == "except_batch":
         axes = list(range(self.batch_ndim))
         axes.remove(self.batch_dim_axis)
@@ -1182,6 +1333,14 @@ class Data(object):
       "%s: dynamic time axis dim (None) (axis %i) but size_placeholder %r misses information" % (
         self, self.time_dim_axis, self.size_placeholder))
     return False
+
+  def get_dynamic_axes(self):
+    """
+    :return: list of axes, counted with batch-dim axis (but we exclude the batch dim axis itself)
+    :rtype: list[int]
+    """
+    return [axis for axis, dim in enumerate(self.batch_shape)
+            if axis != self.batch_dim_axis and dim is None]
 
   def is_same_time_dim(self, other):
     """
@@ -1396,6 +1555,33 @@ class Data(object):
       kind=DimensionTag.Types.Spatial, description="spatial:%i:%s" % (spatial_axes.index(axis), name),
       dimension=self.batch_shape[axis], dyn_size=dyn_size)
     return tag
+
+  def get_size_dim_tag(self, number):
+    """
+    :param int number: index in sorted(size_placeholder.keys())
+    :rtype: DimensionTag
+    """
+    axis_wo_batch = sorted(self.size_placeholder.keys())[number]
+    return self.get_dim_tag(self.get_batch_axis(axis_wo_batch))
+
+  @classmethod
+  def get_common_data(cls, sources):
+    """
+    :param list[Data] sources:
+    :return: some generic data where the sources should be compatible to (with copy_compatible_to)
+    :rtype: Data|None
+    """
+    if not sources:
+      return None
+    # Simple for now: Use first with biggest batch_ndim.
+    # Was even simpler before: Use first.
+    # Later, we could auto-expand all.
+    # However, note that this should also work at template construction time,
+    # where we do not have access to the size_placeholder,
+    # and thus the dimension tags are not reliable (in the current implementation).
+    assert sources
+    max_ndim = max([s.batch_ndim for s in sources])
+    return [s for s in sources if s.batch_ndim == max_ndim][0]
 
 
 _horovod_is_initialized = False
@@ -2443,6 +2629,18 @@ def get_activation_function(s):
   raise Exception("invalid activation function: %r" % s)
 
 
+def gelu(x):
+  """
+  Gaussian Error Linear Units (GELUs) (https://arxiv.org/abs/1606.08415).
+  Alternative to relu.
+
+  :param tf.Tensor x:
+  :rtype: tf.Tensor
+  """
+  import numpy
+  return 0.5 * x * (1 + tf.tanh(numpy.sqrt(2 / numpy.pi) * (x + 0.044715 * tf.pow(x, 3))))
+
+
 def random_uniform_abs_initializer(limit, **kwargs):
   return tf.random_uniform_initializer(minval=-limit, maxval=limit, **kwargs)
 
@@ -2755,6 +2953,8 @@ def swapaxes(x, axis1, axis2):
                 for i in range(ndim)]
       else:
         perm = list(range(ndim))
+        axis1 = axis1 % len(perm)
+        axis2 = axis2 % len(perm)
         perm[axis1] = axis2
         perm[axis2] = axis1
     else:
@@ -3119,6 +3319,55 @@ def batched_uniq(x, seq_lens):
   y, new_seq_lens = sparse_labels_with_seq_lens(x, seq_lens=seq_lens, collapse_repeated=True)
   z = tf.sparse_to_dense(sparse_indices=y.indices, sparse_values=y.values, output_shape=y.dense_shape)
   return z, new_seq_lens
+
+
+def concat_with_opt_broadcast(values, allow_broadcast, axis, name="concat_with_opt_broadcast"):
+  """
+  :param list[tf.Tensor] values: all with same ndim
+  :param list[bool] allow_broadcast: same len as `values`
+  :param int axis:
+  :param str name:
+  :return: basically tf.concat(values, axis), but we can allow broadcasting for some values
+  :rtype: tf.Tensor
+  """
+  assert 0 < len(values) == len(allow_broadcast)
+  if all([not a for a in allow_broadcast]):
+    return tf.concat(values, axis=axis)
+  ndim = values[0].shape.ndims
+  assert ndim, "unknown ndim or scalar: %r" % (values,)
+  for value in values:
+    assert value.shape.ndims == ndim, "ndim does not match in values %r" % (values,)
+  if axis < 0:
+    axis += ndim
+  assert 0 <= axis < ndim
+  with tf.name_scope(name):
+    common_shape = [None] * ndim  # type: typing.List[typing.Union[tf.Tensor,int,None]]
+    for _axis in range(ndim):
+      if _axis == axis:
+        continue  # does not matter
+      for value in values:
+        static_dim = value.shape.dims[_axis].value
+        if common_shape[_axis] in (None, 1):
+          common_shape[_axis] = get_shape_dim(value, _axis)
+        if static_dim is not None:
+          if isinstance(common_shape[_axis], tf.Tensor):
+            common_shape[_axis] = static_dim
+          else:
+            assert common_shape[_axis] == static_dim, "non matching dim %r vs %r in axis %i, value %r of values %r" % (
+              common_shape[_axis], static_dim, _axis, value, values)
+    # Now check all, or maybe unbroadcast.
+    for i in range(len(values)):
+      value = values[i]
+      static_shape = value.shape.as_list()
+      tile_multiples = [common_shape[_axis] if static_shape[_axis] == 1 else 1 for _axis in range(ndim)]
+      tile_multiples[axis] = 1
+      if not all([isinstance(m, int) and m == 1 for m in tile_multiples]):
+        assert allow_broadcast[i], "need to broadcast value %r in values %r with tile multiples %r" % (
+          value, values, tile_multiples)
+        value = tf.tile(value, tile_multiples)
+        values[i] = value
+    # Now do the concat.
+    return tf.concat(values, axis=axis, name=name)
 
 
 def matrix_triangular(shape, dtype=tf.float32, lower=False, upper=False):
@@ -4856,7 +5105,7 @@ def smoothing_cross_entropy(logits,
     return xentropy - normalizing  # shape(labels)
 
 
-def softmax_cross_entropy_over_size(logits, labels):
+def softmax_cross_entropy_over_size(logits, labels, stable_gradient=True):
   """
   The last spatial axis with dyn size info will be used and interpret as the class probabilities
   over the size.
@@ -4870,16 +5119,14 @@ def softmax_cross_entropy_over_size(logits, labels):
   :param Data labels: in prob space. shape compatible to `logits` (but axes can be ordered differently).
     Shape can be e.g. (B,dec-T,enc-T,H...) etc.
     If is has multiple spatial axes, we expect them to be in the same order as of `logits`
+  :param bool stable_gradient: whether to use an explicit gradient
   :return: shape as logits, but the T axis removed.
   :rtype: tf.Tensor
   """
   assert len(logits.size_placeholder) == len(labels.size_placeholder) >= 1  # expect same number, and at least 1
   assert logits.batch_ndim == labels.batch_ndim
-  # Move the enc-time axis to the end if not there (required for softmax_cross_entropy_with_logits).
   logits_enc_time_axis = logits.get_batch_axis(max(logits.size_placeholder.keys()))
-  logits = logits.copy_move_axis(logits_enc_time_axis, -1)
-  logits_enc_time_axis = logits.get_batch_axis(max(logits.size_placeholder.keys()))
-  assert logits_enc_time_axis == logits.batch_ndim - 1
+  enc_seq_len = logits.size_placeholder[logits.get_batch_axis_excluding_batch(logits_enc_time_axis)]
   logits_t = logits.placeholder
   labels_t = labels.placeholder
   # Assume that it is faster to transpose labels, as they are probably static.
@@ -4901,9 +5148,12 @@ def softmax_cross_entropy_over_size(logits, labels):
   labels_t = tf.transpose(labels_t, labels_perm)  # should be same shape as logits
   labels_shape = tf.shape(labels_t)
   n_batch = labels_shape[logits.batch_dim_axis]
-  enc_time_dim = labels_shape[-1]
+  enc_time_dim = labels_shape[logits_enc_time_axis]
   # See SoftmaxOverSpatialLayer.
-  mask = sequence_mask(logits.size_placeholder[logits.get_batch_axis_excluding_batch(logits_enc_time_axis)])  # (B,encT)
+  if logits.batch_dim_axis < logits_enc_time_axis:
+    mask = sequence_mask(enc_seq_len)  # (B,encT)
+  else:
+    mask = sequence_mask_time_major(enc_seq_len)  # (encT,B)
   mask_expand_dims_shape = []
   for i in range(logits.batch_ndim):
     if i == logits.batch_dim_axis:
@@ -4917,10 +5167,16 @@ def softmax_cross_entropy_over_size(logits, labels):
   mask = tf.reshape(mask, mask_expand_dims_shape)  # (...,B,...,enc-T), just like logits/labels
   mask = tf.logical_and(mask, tf.ones_like(labels_t, dtype=tf.bool))  # unbroadcast, needed for tf.where
   logits_t = tf.where(mask, logits_t, float("-inf") * tf.ones_like(logits_t))
-  logits_t = tf.reshape(logits_t, [-1, enc_time_dim])  # (B',enc-T)
-  labels_t = tf.reshape(labels_t, [-1, enc_time_dim])  # (B',enc-T)
-  out = tf.nn.softmax_cross_entropy_with_logits(logits=logits_t, labels=labels_t)  # (B')
-  out = tf.reshape(out, labels_shape[:-1])  # (B,dec-T,H...)
+  # We only apply the mask to the logits. We expect that we already have it zeroed for labels.
+  # Unfortunately we cannot use tf.nn.softmax_cross_entropy_with_logits because we would get inf loss.
+  log_probs_t = tf.nn.log_softmax(logits_t, dim=logits_enc_time_axis)
+  log_probs_t = tf.where(mask, log_probs_t, tf.zeros_like(logits_t))  # filter out the infs
+  out = labels_t * log_probs_t
+  out = -tf.reduce_sum(out, axis=logits_enc_time_axis, keep_dims=True)
+  if stable_gradient:
+    probs_t = tf.nn.softmax(logits_t, dim=logits_enc_time_axis)
+    out = custom_gradient.generic_loss_and_error_signal(loss=out, x=logits_t, grad_x=probs_t - labels_t)
+  out = tf.squeeze(out, axis=logits_enc_time_axis)
   return out
 
 
