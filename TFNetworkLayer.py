@@ -1914,23 +1914,21 @@ class SliceLayer(_ConcatInputLayer):
     slices = [slice(None, None)] * axis + [dim_slice]
     axis_wo_batch = self.input_data.get_batch_axis_excluding_batch(axis)
     self.output.size_placeholder = self.input_data.size_placeholder.copy()
-    if axis == self.input_data.time_dim_axis and self.input_data.time_dim_axis_excluding_batch in self.output.size_placeholder:
+    if axis_wo_batch in self.output.size_placeholder:
       if slice_start:
         assert slice_start > 0
-        self.output.size_placeholder[self.input_data.time_dim_axis_excluding_batch] = \
-          tf.maximum(0, self.output.size_placeholder[self.input_data.time_dim_axis_excluding_batch] - slice_start)
+        self.output.size_placeholder[axis_wo_batch] = \
+          tf.maximum(0, self.output.size_placeholder[axis_wo_batch] - slice_start)
       if slice_end is not None:
         if slice_end < 0:
-          slice_end = tf.shape(self.input_data.placeholder)[self.input_data.time_dim_axis] + slice_end
-        self.output.size_placeholder[self.input_data.time_dim_axis_excluding_batch] = \
+          slice_end = tf.shape(self.input_data.placeholder)[axis] + slice_end
+        self.output.size_placeholder[axis_wo_batch] = \
           tf.minimum(
-            tf.shape(self.input_data.placeholder)[self.input_data.time_dim_axis] - slice_end,
-            self.output.size_placeholder[self.input_data.time_dim_axis_excluding_batch])
+            tf.shape(self.input_data.placeholder)[axis] - slice_end,
+            self.output.size_placeholder[axis_wo_batch])
       if slice_step:
-        self.output.size_placeholder[self.input_data.time_dim_axis_excluding_batch] = \
-          tf.ceil(tf.divide(self.output.size_placeholder[self.input_data.time_dim_axis_excluding_batch], slice_step))
-    elif axis_wo_batch is not None:
-      assert axis_wo_batch not in self.output.size_placeholder
+        self.output.size_placeholder[axis_wo_batch] = \
+          tf.ceil(tf.divide(self.output.size_placeholder[axis_wo_batch], slice_step))
     self.output.placeholder = self.input_data.placeholder[slices]
 
   @classmethod
@@ -2902,10 +2900,11 @@ class UnflattenNdLayer(_ConcatInputLayer):
   layer_class = "unflatten_nd"
   recurrent = True
 
-  def __init__(self, sizes, num_axes, **kwargs):
+  def __init__(self, sizes, num_axes, declare_same_sizes_as=None, **kwargs):
     """
     :param LayerBase sizes:
     :param int num_axes:
+    :param dict[int,LayerBase] declare_same_sizes_as:
     """
     super(UnflattenNdLayer, self).__init__(**kwargs)
     input_data = self.input_data.copy_as_batch_major()
@@ -2914,12 +2913,20 @@ class UnflattenNdLayer(_ConcatInputLayer):
     assert sizes_data.batch_shape[1] in (None, num_axes)  # also allow None...
     self.output.placeholder = TFUtil.unflatten_nd(input_data.placeholder, sizes_data.placeholder, num_axes=num_axes)
     self.output.size_placeholder = {i: sizes_data.placeholder[:, i] for i in range(num_axes)}
+    if declare_same_sizes_as:
+      for i, other in declare_same_sizes_as.items():
+        assert 0 <= i < num_axes
+        other_dim_tag = other.output.get_size_dim_tag(0)
+        other_dim_tag.set_tag_on_size_tensor(self.output.size_placeholder[i])
 
   @classmethod
   def transform_config_dict(cls, d, network, get_layer):
     super(UnflattenNdLayer, cls).transform_config_dict(d, network=network, get_layer=get_layer)
     if "sizes" in d:  # check whether we need the param is later
       d["sizes"] = get_layer(d["sizes"])
+    if d.get("declare_same_sizes_as", None):
+      assert isinstance(d["declare_same_sizes_as"], dict)
+      d["declare_same_sizes_as"] = {i: get_layer(name) for (i, name) in d["declare_same_sizes_as"].items()}
 
   @classmethod
   def get_out_data_from_opts(cls, name, sources, num_axes, **kwargs):
@@ -3677,25 +3684,57 @@ class SqueezeLayer(_ConcatInputLayer):
   """
   layer_class = "squeeze"
 
-  def __init__(self, axis, enforce_batch_dim_axis=0, **kwargs):
+  def __init__(self, axis, enforce_batch_dim_axis=None, allow_no_op=False, **kwargs):
     """
     :param int|list[int]|str axis: one axis or multiple axis to squeeze.
       this is counted with batch-dim, which by default is axis 0 (see enforce_batch_dim_axis).
       it also accepts the special tokens "B"|"batch", "spatial", "spatial_except_time", or "F"|"feature"
+    :param bool allow_no_op:
     """
     super(SqueezeLayer, self).__init__(**kwargs)
     input_data = self.input_data
     if enforce_batch_dim_axis is not None and input_data.batch_dim_axis != enforce_batch_dim_axis:
       input_data = input_data.copy_with_batch_dim_axis(enforce_batch_dim_axis)
-    axes = ReduceLayer.get_axes(axis, input_data=input_data)
+    axes = self._get_axes(axis, input_data=input_data)
     x = input_data.placeholder
     for i in reversed(sorted(axes)):
       x = tf.squeeze(x, axis=i)
     self.output.placeholder = x
+    self.output.size_placeholder = {
+      i - len([j for j in axes if j < input_data.get_batch_axis(i)]): size
+      for (i, size) in input_data.size_placeholder.items()
+      if input_data.get_batch_axis(i) not in axes}
 
   @classmethod
-  def get_out_data_from_opts(cls, enforce_batch_dim_axis=0, **kwargs):
-    return ReduceLayer.get_out_data_from_opts(keep_dims=False, enforce_batch_dim_axis=enforce_batch_dim_axis, **kwargs)
+  def _get_axes(cls, axis, input_data):
+    """
+    :param int|list[int]|str axis: one axis or multiple axis to squeeze.
+    :param Data input_data:
+    :rtype: list[int]
+    """
+    if axis == "auto":
+      return [i for (i, dim) in enumerate(input_data.batch_shape) if dim == 1]
+    return input_data.get_axes_from_description(axis)
+
+  @classmethod
+  def get_out_data_from_opts(cls, axis, enforce_batch_dim_axis=None, allow_no_op=False, sources=(), **kwargs):
+    """
+    :param axis:
+    :param int|None enforce_batch_dim_axis:
+    :param bool allow_no_op:
+    :param list[LayerBase] sources:
+    :rtype: Data
+    """
+    input_data = get_concat_sources_data_template(sources)
+    if enforce_batch_dim_axis is not None:
+      input_data = input_data.copy_with_batch_dim_axis(enforce_batch_dim_axis)
+    if axis == "auto":
+      axis = cls._get_axes(axis, input_data=input_data)
+    if allow_no_op:
+      if not cls._get_axes(axis, input_data=input_data):
+        return input_data.copy("%s_output" % kwargs["name"])
+    return ReduceLayer.get_out_data_from_opts(
+      axis=axis, keep_dims=False, enforce_batch_dim_axis=enforce_batch_dim_axis, sources=sources, **kwargs)
 
 
 class WeightedSumLayer(_ConcatInputLayer):
@@ -3899,10 +3938,10 @@ class DotLayer(LayerBase):
 
   def __init__(self, red1=-1, red2=-2, var1=-2, var2=-1, add_var2_if_empty=True, debug=False, **kwargs):
     """
-    :param str|int|tuple[str|int] red1: reduce axes of first source
-    :param str|int|tuple[str|int] red2: reduce axes of second source
-    :param str|int|tuple[str|int]|None var1: var axes of first source
-    :param str|int|tuple[str|int]|None var2: var axes of second source
+    :param str|int|tuple[str|int]|list[str|int] red1: reduce axes of first source
+    :param str|int|tuple[str|int]|list[str|int] red2: reduce axes of second source
+    :param str|int|tuple[str|int]|list[str|int]|None var1: var axes of first source
+    :param str|int|tuple[str|int]|list[str|int]|None var2: var axes of second source
     :param bool add_var2_if_empty: if var2=None, add dim=1 at the end
     :param bool debug: will print debug shapes, etc.
     """
@@ -4022,10 +4061,10 @@ class DotLayer(LayerBase):
     """
     :param str name:
     :param list[LayerBase] sources:
-    :param str|int|tuple[str|int] red1: reduce axes of first source
-    :param str|int|tuple[str|int] red2: reduce axes of second source
-    :param str|int|tuple[str|int]|None var1: var axes of first source
-    :param str|int|tuple[str|int]|None var2: var axes of second source
+    :param str|int|tuple[str|int]|list[str|int] red1: reduce axes of first source
+    :param str|int|tuple[str|int]|list[str|int] red2: reduce axes of second source
+    :param str|int|tuple[str|int]|list[str|int]|None var1: var axes of first source
+    :param str|int|tuple[str|int]|list[str|int]|None var2: var axes of second source
     :param bool add_var2_if_empty:
     :rtype: Data
     """
@@ -4405,7 +4444,7 @@ class CombineLayer(LayerBase):
       out_type_.update(Data.get_common_data([s.output for s in sources]).get_kwargs())
     if n_out:
       out_type_["dim"] = n_out
-    out_type_.setdefault("name", "%s_output" % kwargs["name"])
+    out_type_["name"] = "%s_output" % kwargs["name"]
     if out_type:
       if isinstance(out_type, dict):
         out_type_.update(out_type)

@@ -55,13 +55,13 @@ def have_min_tf_version(version):
 class DimensionTag(object):
   """
   This identifies one axis/dimension, like a time-dimension, etc.
-  This can be used by :class:`Data`.
+  This can be used by :class:`Data`. See :func:`Data.get_dim_tag`.
   It is not to specify the specific axis in a specific Data/tensor,
   but to specify the content and dimension.
   I.e. if we have the same DimensionTag for two Data instances,
   the dimensions should match. I.e.:
 
-      data1.get_batch_dim_tag(i) == data2.get_batch_dim_tag(j)
+      data1.get_dim_tag(i) == data2.get_dim_tag(j)
         =>  tf.shape(data1.placeholder)[i] == tf.shape(data2.placeholder)[j]
   """
 
@@ -411,6 +411,12 @@ class Data(object):
     return {key: getattr(self, key) for key in keys}
 
   def get_description(self, with_name=True, with_placeholder=False):
+    """
+    :param bool with_name:
+    :param bool with_placeholder:
+    :return: description of self. also used for __repr__
+    :rtype: str
+    """
     keys = ["shape"]
     if self.sparse:
       keys.append("dtype")
@@ -529,12 +535,12 @@ class Data(object):
     data = self.copy()
     if data.placeholder is not None:
       data.placeholder = move_axis(data.placeholder, old_axis, new_axis)
-    data.batch_dim_axis = translate_axis(data.batch_dim_axis)
-    new_feature_dim_axis = translate_axis(data.feature_dim_axis)
+    data.batch_dim_axis = translate_axis(self.batch_dim_axis)
+    new_feature_dim_axis = translate_axis(self.feature_dim_axis)
     if new_feature_dim_axis != data.feature_dim_axis:
       # Only assign in this case. Otherwise, e.g. if it is NotSpecified, leave it like that.
       data.feature_dim_axis = new_feature_dim_axis
-    data.time_dim_axis = translate_axis(data.time_dim_axis)
+    data.time_dim_axis = translate_axis(self.time_dim_axis)
     if data.size_placeholder:
       data.size_placeholder = {
         data.get_batch_axis_excluding_batch(translate_axis(self.get_batch_axis(i))): size
@@ -1232,6 +1238,15 @@ class Data(object):
           s += len(spatial_axes)
         assert s < len(spatial_axes), "%s get_axes_from_description: %r invalid" % (self, axes)
         axes = spatial_axes[s]
+      elif axes in ["dyn", "dynamic"]:
+        axes = self.get_dynamic_axes()
+      elif re.match("(d|dyn|dynamic):-?\\d+$", axes):
+        s = int(axes.split(":")[1])
+        dyn_axes = self.get_dynamic_axes()
+        if s < 0:
+          s += len(dyn_axes)
+        assert 0 <= s < len(dyn_axes), "%s get_axes_from_description: %r invalid" % (self, axes)
+        axes = dyn_axes[s]
       elif axes == "spatial_except_time":
         axes = self.get_spatial_batch_axes()
         assert self.time_dim_axis is not None
@@ -1252,7 +1267,14 @@ class Data(object):
       elif axes == "*":
         axes = list(range(self.batch_ndim))
       elif axes == "static":
-        axes = [i for i in range(self.batch_ndim) if self.batch_shape[i] is not None]
+        axes = self.get_static_axes()
+      elif re.match("(static):-?\\d+$", axes):
+        s = int(axes.split(":")[1])
+        static_axes = self.get_static_axes()
+        if s < 0:
+          s += len(static_axes)
+        assert 0 <= s < len(static_axes), "%s get_axes_from_description: %r invalid" % (self, axes)
+        axes = static_axes[s]
       elif axes in ["f", "feature", "non_spatial"]:
         axes = self.get_feature_batch_axes()
       elif all([a in "btf" for a in axes]):
@@ -1341,6 +1363,14 @@ class Data(object):
     """
     return [axis for axis, dim in enumerate(self.batch_shape)
             if axis != self.batch_dim_axis and dim is None]
+
+  def get_static_axes(self):
+    """
+    :return: list of axes, counted with batch-dim axis (but we exclude the batch dim axis itself)
+    :rtype: list[int]
+    """
+    return [axis for axis, dim in enumerate(self.batch_shape)
+            if axis != self.batch_dim_axis and dim is not None]
 
   def is_same_time_dim(self, other):
     """
@@ -1563,6 +1593,13 @@ class Data(object):
     """
     axis_wo_batch = sorted(self.size_placeholder.keys())[number]
     return self.get_dim_tag(self.get_batch_axis(axis_wo_batch))
+
+  def get_batch_shape_dim_tags(self):
+    """
+    :return: list of dimension tags, for each axis (counted with batch dim, i.e. len is batch_ndim)
+    :rtype: tuple[DimensionTag]
+    """
+    return tuple([self.get_dim_tag(i) for i in range(self.batch_ndim)])
 
   @classmethod
   def get_common_data(cls, sources):
