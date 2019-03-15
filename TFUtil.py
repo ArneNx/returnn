@@ -5406,7 +5406,7 @@ class GlobalTensorArrayOpMaker:
     #include "tensorflow/core/platform/types.h"
 
     using namespace tensorflow;
-  
+
     // Adopted from https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/ops/data_flow_ops.cc.
     REGISTER_OP("GlobalTensorArray")
     .Input("size: int32")
@@ -5428,7 +5428,7 @@ class GlobalTensorArrayOpMaker:
       return Status::OK();
     })
     .Doc("GlobalTensorArray, persistent across runs");
-    
+
     // Copied from https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/kernels/tensor_array_ops.cc,
     // and https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/framework/resource_op_kernel.h.
     // The original TensorArrayOp used the per-run ("per-step") resource manager container
@@ -5452,7 +5452,7 @@ class GlobalTensorArrayOpMaker:
                                 tensorflow::DT_STRING, tensorflow::TensorShape({2}),
                                 &handle_, alloc_attr));
       }
-    
+
       ~GlobalTensorArrayOp() {
         if (resource_ != nullptr) {
           resource_->Unref();
@@ -5465,7 +5465,7 @@ class GlobalTensorArrayOpMaker:
           }
         }
       }
-    
+
       void Compute(OpKernelContext* ctx) override {
         mutex_lock l(mu_);
         if (resource_ == nullptr) {
@@ -5481,7 +5481,7 @@ class GlobalTensorArrayOpMaker:
         Tensor* handle;
         OP_REQUIRES_OK(ctx, ctx->allocate_output(0, TensorShape({}), &handle));
         handle->flat<ResourceHandle>()(0) =
-            resource_->resource_handle(ctx);            
+            resource_->resource_handle(ctx);
         if (ctx->num_outputs() == 2) {
           // Create the flow output.
           Tensor* flow;
@@ -5494,14 +5494,14 @@ class GlobalTensorArrayOpMaker:
           }
         }
       }
-    
+
      private:
       Status CreateTensorArray(OpKernelContext* ctx, ResourceMgr* rm,
                                Tensor* tensor_array_output_handle,
                                TensorArray** output_tensor_array) EXCLUSIVE_LOCKS_REQUIRED(mu_) {
         const Tensor* tensor_size;
         TF_RETURN_IF_ERROR(ctx->input("size", &tensor_size));
-    
+
         if (!TensorShapeUtils::IsScalar(tensor_size->shape())) {
           return errors::InvalidArgument(
               "TensorArray size must be scalar, but had shape: ",
@@ -5511,18 +5511,18 @@ class GlobalTensorArrayOpMaker:
         if (size < 0) {
           return errors::InvalidArgument("Size should be >= 0.");
         }
-    
+
         TensorArray* tensor_array = new TensorArray(
             cinfo_.name(), dtype_, *tensor_array_output_handle, size, element_shape_,
             dynamic_size_, false /* multiple_writes_aggregate */,
             false /* is_grad */, -1 /* marked_size */, clear_after_read_);
-    
+
         // TODO: could use LookupOrCreate instead...
         TF_RETURN_IF_ERROR(
             rm->Create(cinfo_.container(), cinfo_.name(), tensor_array));
-    
+
         *output_tensor_array = tensor_array;
-    
+
         return Status::OK();
       }
 
@@ -5530,17 +5530,17 @@ class GlobalTensorArrayOpMaker:
       ContainerInfo cinfo_ GUARDED_BY(mu_);
       PersistentTensor handle_ GUARDED_BY(mu_);
       TensorArray* resource_ GUARDED_BY(mu_) = nullptr;
-      
+
       const DeviceType device_type_;
       DataType dtype_;
       PartialTensorShape element_shape_;
       bool dynamic_size_;
       bool clear_after_read_;
       string tensor_array_name_;  // The name used to create the TensorArray.
-      
+
       TF_DISALLOW_COPY_AND_ASSIGN(GlobalTensorArrayOp);
     };
-    
+
     REGISTER_KERNEL_BUILDER(Name("GlobalTensorArray").Device(DEVICE_CPU), GlobalTensorArrayOp);
 
   """
@@ -5712,7 +5712,7 @@ class TFArrayContainer(object):
                                          " but got ", DataTypeString(ar->dtype_), ".");
         return Status::OK();
       }
-  
+
       DataType dtype_;
     };
     REGISTER_KERNEL_BUILDER(Name("ArrayContainerCreate").Device(DEVICE_CPU), ArrayContainerCreateOp);
@@ -5723,9 +5723,9 @@ class TFArrayContainer(object):
 
       void Compute(OpKernelContext* context) override {
         ArrayContainer* ar;
-        
+
         const Tensor* handle;
-        OP_REQUIRES_OK(context, context->input("handle", &handle));        
+        OP_REQUIRES_OK(context, context->input("handle", &handle));
         OP_REQUIRES_OK(context, GetResourceFromContext(context, "handle", &ar));
         core::ScopedUnref unref(ar);
 
@@ -5802,7 +5802,7 @@ class TFArrayContainer(object):
         const Tensor* tensor_value;
         OP_REQUIRES_OK(context, context->input("index", &tensor_index));
         OP_REQUIRES_OK(context, context->input("value", &tensor_value));
-    
+
         OP_REQUIRES(context, TensorShapeUtils::IsScalar(tensor_index->shape()),
                     errors::InvalidArgument(
                         "index must be scalar, but had shape: ",
@@ -7134,3 +7134,48 @@ def get_non_deterministic_ops_from_graph():
     # elif ... more non det ops to be added
 
   return non_det_ops
+
+
+def merge_tensor_array_with_padding(arr, row_lengths, feature_dims):
+  """
+  Merges a tensor array of multiple tensors into a single tensor, while padding them to given length
+  :param tf.TensorArray arr: array to merge with tensor i of form (T[i],None)
+  :param tf.Tensor[int32] row_lengths: shape=(B,) length of each row
+  :param list[tf.Dimension] feature_dims: shape of the last dimension
+  :return: tensor that contains all elements of arr stacked along the first dimension and zero-padded to pad_length
+  shape=(B,pad_to_length,None)
+  :rtype: tf.Tensor
+  """
+  # add padding to labels and offset to positions:
+  pad_to_length = tf.reduce_max(row_lengths)
+  arr_pad = tf.TensorArray(dtype=arr.dtype, size=arr.size(), dynamic_size=False, infer_shape=True)
+  i = tf.constant(0)
+
+  def while_condition(i, arr_pad):
+    return tf.less(i, arr.size())  # iterate over batches
+
+  def body(i, arr_pad):
+    # copy arr[i] into first positions of a row filled with 0:
+    non_pad_pos = tf.expand_dims(tf.range(row_lengths[i]), -1)
+    arr_i_padded = tf.scatter_nd(non_pad_pos,arr.read(i),[pad_to_length]+feature_dims)
+    arr_pad = arr_pad.write(i, arr_i_padded)
+    return [tf.add(i, 1), arr_pad]
+
+  _, arr_pad = tf.while_loop(while_condition, body, [i, arr_pad], back_prop=True)
+  return arr_pad.stack()
+
+
+def sample_without_replacement(logits, k, seed=None):
+  """
+  This is equivalent to sampling `k` times without replacement from a categorial distribution with logits `logits`.
+  Discussion on Github: https://github.com/tensorflow/tensorflow/issues/9260#issuecomment-437875125
+  Details here: https://timvieira.github.io/blog/post/2014/08/01/gumbel-max-trick-and-weighted-reservoir-sampling/
+  :param tf.Tensor[tf.float32] logits: log probability for each possible sample
+  :param tf.Tensor[tf.int32] k: number of samples to draw
+  :param int|None seed: random seed
+  :return: k indices sampled from the distribution
+  :rtype: tf.Tensor[tf.int32]
+  """
+  z = -tf.log(-tf.log(tf.random_uniform(tf.shape(logits), 0, 1, seed=seed)))  # Gumbel noise
+  _, indices = tf.nn.top_k(logits + z, k)
+  return indices
