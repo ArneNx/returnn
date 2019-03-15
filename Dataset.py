@@ -967,7 +967,6 @@ def get_dataset_class(name):
   # Only those modules which make sense to be loaded by the user,
   # because this function is only used for such cases.
   mod_names = ["HDFDataset", "SprintDataset", "GeneratingDataset", "NumpyDumpDataset", "MetaDataset", "LmDataset", "StereoDataset", "RawWavDataset"]
-  mod_names += ["master_thesis.MLmDataset"]
   for mod_name in mod_names:
     mod = import_module(mod_name)
     if name in vars(mod):

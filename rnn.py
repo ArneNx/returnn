@@ -32,8 +32,6 @@ from HDFDataset import HDFDataset
 from Debug import initIPythonKernel, initBetterExchook, initFaulthandler, initCudaNotInMainProcCheck
 from Util import initThreadJoinHack, describe_crnn_version, describe_theano_version, \
   describe_tensorflow_version, BackendEngine, get_tensorflow_version_tuple
-import master_thesis
-
 
 config = None; """ :type: Config """
 engine = None; """ :type: TFEngine.Engine | Engine """
