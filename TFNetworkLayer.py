@@ -7096,28 +7096,30 @@ def get_layer_class_name_list():
   return sorted(_LayerClassDict.keys())
 
 
-class GatherPositionsLayer(_ConcatInputLayer):
+class GatherPositionsLayer(LayerBase):
   """
   Gathers the vectors at the specified positions.
   """
   layer_class = "gather_positions"
 
-  def __init__(self, positions, **kwargs):
+  def __init__(self, **kwargs):
     """
     Gathers input data at given positions.
     Output has shape (B,max(num_positions),None) and is zero-padded for each sequence.
-    :param Layer positions: with output shape=(B,max(num_positions),) positions to gather for each sequence
-     from input_data (absolute positions within batch)
-    :param kwargs:
+    Inputs: [LayerBase,LayerBase] [input_data,positions]: with
+    input_data: shape=(B,T,None)
+    positions: shape=(B,max(num_positions),) positions to gather for each sequence
+    from input_data (absolute positions within batch)
     """
     super(GatherPositionsLayer, self).__init__(**kwargs)
+    input_data = self.sources[0].output
+    positions = self.sources[1].output
+    batch_size = input_data.get_batch_dim()
+    seq_length = tf.shape(input_data.placeholder)[input_data.time_dim_axis]
+    feature_lengths = [tf.shape(input_data.placeholder)[ax] for ax in input_data.get_feature_batch_axes()]
+    data_flat = tf.reshape(input_data.placeholder, [batch_size*seq_length]+feature_lengths)
 
-    batch_size = self.input_data.get_batch_dim()
-    seq_length = self.input_data.placeholder.shape[self.input_data.time_dim_axis]
-    feature_lengths = [self.input_data.placeholder.shape[ax] for ax in self.input_data.get_feature_batch_axes()]
-    data_flat = tf.reshape(self.input_data.placeholder, [batch_size*seq_length]+feature_lengths)
-
-    positions_w_offset = positions.output.copy_as_batch_major()
+    positions_w_offset = positions.copy_as_batch_major()
     positions_w_offset.placeholder = tf.reshape(positions_w_offset.placeholder, [batch_size,-1])
     offsets = tf.reshape(tf.range(0, batch_size, dtype=tf.int32), [batch_size,1]) \
               * seq_length * tf.ones_like(positions_w_offset.placeholder)
@@ -7161,7 +7163,7 @@ class GatherPositionsLayer(_ConcatInputLayer):
     return data
 
 
-class ProbabilisticMaskLayer(_ConcatInputLayer):
+class ProbabilisticMaskLayer(LayerBase):
   """
   This layer performs BERT-style masking on the fly for a given source sequence.
   If additionally a target sequence is given, it will concatenate source
@@ -7171,7 +7173,6 @@ class ProbabilisticMaskLayer(_ConcatInputLayer):
 
   def __init__(self,
                vocab,
-               target_data=None,
                vocab_probs=None,
                seq_end_symbol="</S>",
                mask_symbol="</M>",
@@ -7184,12 +7185,13 @@ class ProbabilisticMaskLayer(_ConcatInputLayer):
                mask_m_prob=0.8,
                mask_r_prob=0.1,
                random_seed=42,
+               fixed_src_mask=None,
+               fixed_trg_mask=None,
                *args,
                **kwargs):
     """
 
     :param str vocab: path to vocabulary dict in form {"word": idx}
-    :param LayerBase target_data: target sequence to combine with input_data
     :param str|None vocab_probs: path to dictionary containing probabilities to mask
     each individual token in a sequence in form {"word": prob}
     :param str seq_end_symbol: token to end each sequence
@@ -7205,9 +7207,14 @@ class ProbabilisticMaskLayer(_ConcatInputLayer):
     if mask_pad_factor is a tuple, mask_pad_factor=uniform_random(mask_pad_factor[0],mask_pad_factor[1]) for each seq
     :param float mask_m_prob: probability that a selected position is replaced by mask token
     :param float mask_r_prob: probability that a selected position is replaced by random token from vocab
+    :param LayerBase|None fixed_src_mask: mask in form of a tensor of src length
+    containing 0/1/2/-1 (mask/random/keep/no-mask) for each position
+    :param LayerBase|None fixed_trg_mask: mask in form of a tensor of trg length
+    containing 0/1/2/-1 (mask/random/keep/no-mask) for each position
     :param args:
     :param kwargs:
 
+    Inputs: [LayerBase,LayerBase|None] [source_data,target_data]: source sequences and target sequences to mask
     Outputs:
     masked_sequence: shape=(B,T',None)  -> sequence with masking applied
        (may be concatenation of src_sequence and trg_sequence + padding if trg_sequence given)
@@ -7218,7 +7225,6 @@ class ProbabilisticMaskLayer(_ConcatInputLayer):
     super(ProbabilisticMaskLayer, self).__init__(*args, **kwargs)
     self.random_seed = random_seed
     self.max_seq_len = max_seq_len
-
     self.mask_prob = mask_prob
     self.mask_m_prob = mask_m_prob
     self.mask_r_prob = mask_r_prob
@@ -7227,22 +7233,29 @@ class ProbabilisticMaskLayer(_ConcatInputLayer):
     self.mask_trg_factor = mask_trg_factor
     self.mask_pad_factor = mask_pad_factor
 
+    source_data = self.sources[0].output
+    target_data = self.sources[1].output if len(self.sources)>1 else None
+
     self.vocab = self._read_dict(vocab)
     self.seq_end_symbol = self.vocab[seq_end_symbol]
     self.mask_symbol = self.vocab[mask_symbol]
-    self.target_data = target_data.output if target_data else None
-    if self.target_data is not None:
+    if target_data is not None:
       self.separator_symbol = self.vocab[separator_symbol]
     self.vocab_length = max(self.vocab.values()) + 1
     self.vocab_probs = self._get_vocab_probs(vocab_probs)
 
-    src = self.input_data.get_placeholder_as_batch_major()
-    src_lengths = self.input_data.get_sequence_lengths()
-    trg = self.target_data.get_placeholder_as_batch_major() if self.target_data else None
-    trg_lengths = self.target_data.get_sequence_lengths() if self.target_data else None
+    src = source_data.get_placeholder_as_batch_major()
+    src_lengths = source_data.get_sequence_lengths()
+    src_mask = fixed_src_mask.output.get_placeholder_as_batch_major() if fixed_src_mask else None
+    trg = target_data.get_placeholder_as_batch_major() if target_data else None
+    trg_lengths = target_data.get_sequence_lengths() if target_data else None
+    trg_mask = fixed_trg_mask.output.get_placeholder_as_batch_major() if fixed_trg_mask else None
+
 
     masked_sequence, labels, positions, num_positions, masked_seq_lens = self._construct_masked_seq(src, src_lengths,
-                                                                                                    trg, trg_lengths)
+                                                                                                    trg, trg_lengths,
+                                                                                                    src_mask, trg_mask
+                                                                                                    )
     self.output_dict = {
       "masked_sequence": masked_sequence,
       "labels": labels,
@@ -7250,7 +7263,7 @@ class ProbabilisticMaskLayer(_ConcatInputLayer):
       "num_positions": num_positions
     }
     self.output.placeholder = masked_sequence
-    self.output.size_placeholder = self.input_data.size_placeholder.copy()
+    self.output.size_placeholder = source_data.size_placeholder.copy()
     self.output.size_placeholder[0] = masked_seq_lens
 
   @classmethod
@@ -7259,15 +7272,17 @@ class ProbabilisticMaskLayer(_ConcatInputLayer):
     shape = sources[0].output.shape
     data = Data(
       name=name,
-      shape=[shape[0],1] if output_name == "positions" else sources[0].output.shape,
+      shape=[shape[0],1] if output_name == "positions" else shape,
       dim=1 if output_name == "positions" else sources[0].output.dim,
-      sparse=False,
+      sparse=False if output_name == "positions" else True,
       batch_dim_axis=sources[0].output.batch_dim_axis,
       time_dim_axis=sources[0].output.time_dim_axis,
       feature_dim_axis=sources[0].output.feature_dim_axis_or_unspecified,
       dtype="int32" if output_name == "positions" else sources[0].output.dtype,
       beam_size=sources[0].output.beam_size)
     return data
+    # return super(ProbabilisticMaskLayer, cls).get_out_data_from_opts(n_out=1 if output_name == "positions" else sources[
+    #   0].output.dim)
 
   def get_sub_layer(self, layer_name):
     """
@@ -7285,7 +7300,7 @@ class ProbabilisticMaskLayer(_ConcatInputLayer):
     full_layer_name = self.name + '/' + layer_name
 
     output = self.get_out_data_from_opts(output_name=layer_name, sources=self.sources, name=full_layer_name,
-                                         target_data=self.target_data, max_seq_len=self.max_seq_len,
+                                         max_seq_len=self.max_seq_len,
                                          mask_prob=self.mask_prob, mask_tar_factor=self.mask_trg_factor,
                                          mask_pad_factor=self.mask_pad_factor)
 
@@ -7293,7 +7308,7 @@ class ProbabilisticMaskLayer(_ConcatInputLayer):
     sub_layer = InternalLayer(name=full_layer_name, output=output, network=self.network, sources=[self])
     sub_layer.output.placeholder = self.output_dict[layer_name]
     if layer_name == "labels":
-      sub_layer.output.size_placeholder = self.input_data.size_placeholder.copy()
+      sub_layer.output.size_placeholder = self.sources[0].output.size_placeholder.copy()
     else:
       sub_layer.output.size_placeholder = {}
     # the length along the time axis in this case is given by num_positions
@@ -7348,13 +7363,14 @@ class ProbabilisticMaskLayer(_ConcatInputLayer):
     vocab_probs_tensor = tf.convert_to_tensor(vocab_probs_tensor)
     return vocab_probs_tensor
 
-  def _mask_seq(self, seq, mask_prob, seq_lens):
+  def _mask_seq(self, seq, mask_prob, seq_lens, fixed_mask):
     """
     Creates the masked version of a given batch of sequences,
     the corresponding positions and labels for the masked LM objective.
     :param tf.Tensor seq: shape=(B,T,None) batch of sequences to mask
     :param tf.constant[float] mask_prob: probability to mask a position in range [0,1)
     :param tf.Tensor[int32] seq_lens: shape=(B,) length information for each sequence
+    :param tf.Tensor[int32]|None fixed_mask: shape=(B,T) tensor containing 0/1/2/-1 for mask/random/keep/no-mask
     :return:
       tf.Tensor masked_inp_tensor: shape=(B,T,None), input sequence that's masked at some positions
       tf.TensorArray labels_tensor: B * shape=(T[i]*mask_prob,None), correct ('unmasked') labels for those positions
@@ -7363,15 +7379,15 @@ class ProbabilisticMaskLayer(_ConcatInputLayer):
       tf.Tensor num_positions_tensor: shape=(B,), number of masked positions for each sequence
     :rtype: (tf.Tensor,tf.TensorArray,tf.TensorArray[int32],tf.Tensor[int32])
     """
-    masked_inp = tf.TensorArray(dtype=seq.dtype, size=seq.shape[0], dynamic_size=False, infer_shape=True)
-    labels = tf.TensorArray(dtype=seq.dtype, size=seq.shape[0], dynamic_size=False, infer_shape=False)
-    positions = tf.TensorArray(dtype=tf.int32, size=seq.shape[0], dynamic_size=False, infer_shape=False)
-    num_positions = tf.TensorArray(dtype=tf.int32, size=seq.shape[0], dynamic_size=False, infer_shape=True)
+    masked_inp = tf.TensorArray(dtype=seq.dtype, size=tf.shape(seq)[0], dynamic_size=False, infer_shape=True)
+    labels = tf.TensorArray(dtype=seq.dtype, size=tf.shape(seq)[0], dynamic_size=False, infer_shape=False)
+    positions = tf.TensorArray(dtype=tf.int32, size=tf.shape(seq)[0], dynamic_size=False, infer_shape=False)
+    num_positions = tf.TensorArray(dtype=tf.int32, size=tf.shape(seq)[0], dynamic_size=False, infer_shape=True)
 
     i = tf.constant(0)
 
     def while_condition(i, masked_inp, labels, positions, num_positions):
-      return tf.less(i, seq.shape[0])  # iterate over batches
+      return tf.less(i, tf.shape(seq)[0])  # iterate over batches
 
     def body(i, masked_inp, labels, positions, num_positions):
       """
@@ -7380,26 +7396,34 @@ class ProbabilisticMaskLayer(_ConcatInputLayer):
       and we don't want to predict/mask any padding positions
       however, TF might be able to parallelize this across the batch
       """
-      num_to_predict = tf.maximum(tf.constant(1),
-                                  tf.cast(tf.round(tf.to_float(seq_lens[i]) * mask_prob), dtype=tf.int32))
-      if self.vocab_probs is None:
-        # select num_to_predict positions uniformly at random:
-        selected_indices = tf.range(seq_lens[i], dtype=tf.int32)
-        selected_indices = tf.random_shuffle(selected_indices, seed=self.random_seed)  # randomize positions to select
-        selected_indices = selected_indices[:num_to_predict]  # select mask_prob * seq_len many positions for a loss
+      if fixed_mask is not None:
+        fixed_mask_i = fixed_mask[i][:seq_lens[i]]
+        selected_indices = tf.cast(tf.where(tf.not_equal(fixed_mask_i, tf.constant(-1)))[:,0], dtype=tf.int32)
+        num_to_predict = tf.shape(selected_indices)[0]
+        choice = tf.gather(fixed_mask_i, selected_indices)
       else:
-        # select num_to_predict positions according to probability assigned to the word:
-        probs = tf.gather(self.vocab_probs, tf.squeeze(tf.cast(seq[i][:seq_lens[i]],dtype=tf.int32),axis=1))
-        logits = tf.log(probs / tf.reduce_sum(probs))
-        selected_indices = TFUtil.sample_without_replacement(logits, num_to_predict, seed=self.random_seed)
+        num_to_predict = tf.maximum(tf.constant(1),
+                                  tf.cast(tf.round(tf.to_float(seq_lens[i]) * mask_prob), dtype=tf.int32))
+        if self.vocab_probs is None:
+          # select num_to_predict positions uniformly at random:
+          selected_indices = tf.range(seq_lens[i], dtype=tf.int32)
+          selected_indices = tf.random_shuffle(selected_indices, seed=self.random_seed)  # randomize positions to select
+          selected_indices = selected_indices[:num_to_predict]  # select mask_prob * seq_len many positions for a loss
+        else:
+          # select num_to_predict positions according to probability assigned to the word:
+          probs = tf.gather(self.vocab_probs, tf.reshape(tf.cast(seq[i][:seq_lens[i]],dtype=tf.int32), [seq_lens[i]]))
+          logits = tf.log(probs / tf.reduce_sum(probs))
+          selected_indices = TFUtil.sample_without_replacement(logits, num_to_predict, seed=self.random_seed)
+
+        # now calculate what to replace the selected positions with:
+        logits = tf.log(tf.constant([[self.mask_m_prob, self.mask_r_prob, self.mask_k_prob]]))
+        # generate random choices for: 0 = mask, 1 = rnd replace, 2 = keep
+        choice = tf.multinomial(logits, num_to_predict, output_dtype=tf.int32, seed=self.random_seed)
+
       labels_i = tf.gather(seq[i], selected_indices)  # add a label only to selected positions
 
-      # now calculate what to replace the selected positions with:
       shape = [num_to_predict]+list(seq.shape[2:])
-      logits = tf.log(tf.constant([[self.mask_m_prob, self.mask_r_prob, self.mask_k_prob]]))
-      # generate random choices for: 0 = mask, 1 = rnd replace, 2 = keep
-      choice = tf.multinomial(logits, num_to_predict, output_dtype=tf.int32, seed=self.random_seed)
-      choice = tf.expand_dims(tf.squeeze(choice),axis=-1) * tf.ones(shape, dtype=tf.int32)
+      choice = tf.reshape(choice, shape)
 
       # every index with 0 in choice gets replaced by masked_symbol
       mask_symbol_vector = tf.constant([self.mask_symbol], dtype=seq.dtype) + tf.zeros(shape, dtype=seq.dtype)
@@ -7411,8 +7435,8 @@ class ProbabilisticMaskLayer(_ConcatInputLayer):
       mask_values = tf.where(tf.equal(choice, tf.constant(1)), rand_vector, mask_values)
       # every index with 2 in choice (all remaining) is kept unchanged
 
-      update = tf.scatter_nd(selected_indices, mask_values, seq[i].shape)
-      bool_mask = tf.cast(tf.scatter_nd(selected_indices, tf.ones_like(mask_values, dtype=tf.uint8), seq[i].shape),
+      update = tf.scatter_nd(tf.reshape(selected_indices, [-1,1]), mask_values, tf.shape(seq[i]))
+      bool_mask = tf.cast(tf.scatter_nd(tf.reshape(selected_indices, [-1,1]), tf.ones_like(mask_values, dtype=tf.uint8), tf.shape(seq[i])),
                           dtype=tf.bool)
       masked_inp_i = tf.where(bool_mask, update, seq[i])  # copy mask_values to selected_indices in original sequence
 
@@ -7451,13 +7475,15 @@ class ProbabilisticMaskLayer(_ConcatInputLayer):
     else:
       return tf.constant(self.mask_prob) * tf.constant(mask_factor)
 
-  def _construct_masked_seq(self, src, src_lengths, trg=None, trg_lengths=None):
+  def _construct_masked_seq(self, src, src_lengths, trg=None, trg_lengths=None, fixed_src_mask=None, fixed_trg_mask=None):
     """
 
-    :param Tensor src: batch of (source) sequences to mask
+    :param tf.Tensor src: shape=(B,T,None) batch of (source) sequences to mask
     :param list(int) src_lengths: list of sequence lengths for the batch
-    :param Tensor|None trg: optional target sequence to concatenate with source sequence (and padding) if given
-    :param list(int)|None trg_lengths: list of sequence lengths for the batch of target sequences
+    :param tf.Tensor|None trg: optional target sequence to concatenate with source sequence (and padding) if given
+    :param list(int)|None trg_lengths: shape=(B,T_trg,None) list of sequence lengths for the batch of target sequences
+    :param tf.Tensor[tf.int32]|None fixed_src_mask: shape=(B,T) with 0/1/2/-1 in each position for mask/random/keep/no-mask
+    :param tf.Tensor[tf.int32]|None fixed_trg_mask: shape=(B,T_trg+1) with 0/1/2/-1 in each position for mask/random/keep/no-mask
     :return:
     src_masked: shape=(B,T',None) masked sequence (combined src + trg + pad if trg given)
     src_labels: shape=(B,max(num_src_positions),None) labels for masked positions
@@ -7472,7 +7498,8 @@ class ProbabilisticMaskLayer(_ConcatInputLayer):
     src_masked, src_labels_array, src_positions_array, num_src_positions = self._mask_seq(src,
                                                                                           self._get_mask_prob(
                                                                                             self.mask_src_factor),
-                                                                                          src_lengths)
+                                                                                          src_lengths,
+                                                                                          fixed_src_mask)
     if trg is not None:
       assert trg_lengths is not None
       assert trg.dtype == src.dtype
@@ -7483,19 +7510,21 @@ class ProbabilisticMaskLayer(_ConcatInputLayer):
       trg_masked, trg_labels_array, trg_positions_array, num_trg_positions = self._mask_seq(trg,
                                                                                             self._get_mask_prob(
                                                                                               self.mask_trg_factor),
-                                                                                            trg_lengths)
+                                                                                            trg_lengths,
+                                                                                            fixed_trg_mask)
       pad_lengths = tf.maximum(tf.minimum(self.max_seq_len, src_lengths * 3) - trg_lengths, tf.constant(1))
       pad = tf.ones([trg.shape[0], tf.Dimension(3) * src.shape[1]] + list(trg.shape[2:]),
                       dtype=trg.dtype) * self.seq_end_symbol
       pad_masked, pad_labels_array, pad_positions_array, num_pad_positions = self._mask_seq(pad,
                                                                                             self._get_mask_prob(
                                                                                               self.mask_pad_factor),
-                                                                                            pad_lengths)
+                                                                                            pad_lengths,
+                                                                                            None)
 
       i = tf.constant(0)
-      combined_seqs_array = tf.TensorArray(dtype=tf.int32, size=src.shape[0], dynamic_size=False, infer_shape=False)
-      combined_labels_array = tf.TensorArray(dtype=src.dtype, size=src.shape[0], dynamic_size=False, infer_shape=False)
-      combined_positions_array = tf.TensorArray(dtype=tf.int32, size=src.shape[0], dynamic_size=False, infer_shape=False)
+      combined_seqs_array = tf.TensorArray(dtype=tf.int32, size=tf.shape(src)[0], dynamic_size=False, infer_shape=False)
+      combined_labels_array = tf.TensorArray(dtype=src.dtype, size=tf.shape(src)[0], dynamic_size=False, infer_shape=False)
+      combined_positions_array = tf.TensorArray(dtype=tf.int32, size=tf.shape(src)[0], dynamic_size=False, infer_shape=False)
 
       def while_condition(i, combined_labels_array, combined_positions_array, combined_seqs_array):
         return tf.less(i, src.shape[0])  # iterate over batches
