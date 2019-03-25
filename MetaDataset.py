@@ -124,11 +124,10 @@ class MetaDataset(CachedDataset2):
 
     if not blind_mode:
       self.seq_list_original = self._load_seq_list(seq_list_file) # type: dict[str,list[str]]  # dataset key -> seq list
-    self.num_total_seqs = len(self.seq_list_original[self.default_dataset_key])
-    for key in self.dataset_keys:
-      assert len(self.seq_list_original[key]) == self.num_total_seqs
-
-    self.tag_idx = {tag: idx for (idx, tag) in enumerate(self.seq_list_original[self.default_dataset_key])}
+      self.num_total_seqs = len(self.seq_list_original[self.default_dataset_key])
+      for key in self.dataset_keys:
+        assert len(self.seq_list_original[key]) == self.num_total_seqs
+      self.tag_idx = {tag: idx for (idx, tag) in enumerate(self.seq_list_original[self.default_dataset_key])}
 
     if seq_lens_file:
       seq_lens = load_json(filename=seq_lens_file)
