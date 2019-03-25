@@ -1,7 +1,20 @@
-
 """
-Several wrappers around datasets are defined here, such as :class:`MetaDataset`,
-which are itself datasets again.
+There are use cases in which we want to combine several datasets:
+
+ * **Multimodality:** features from several datasets should be provided at the same time
+
+   * Examples: multi-source translation, speech translation with source CTC loss for stability (needs both source audio and transcription)
+
+ * **Multi-Task Learning:** several datasets should be used alternatingly, such that at each time the dataset of the corresponding task is selected
+
+   * Examples: multi-task speech translation (either from audio or from text)
+
+ * **Combination of Corpora:** the training data should be split into different datatsets. This allows creating a combined corpus dynamically
+   and avoids manual concatenation/shuffling.
+
+   * Examples: multi-lingual translation systems (datasets can be reused from corresponding bilingual systems)
+
+The dataset classes MetaDataset and CombinedDataset which perform these tasks are implemented in MetaDataset.py.
 """
 
 from __future__ import print_function
@@ -24,6 +37,38 @@ class EpochWiseFilter:
     self.epochs_opts = epochs_opts
     self.debug_msg_prefix = debug_msg_prefix
 
+  @classmethod
+  def filter_epoch(cls, opts, seq_order, get_seq_len, debug_msg_prefix):
+    """
+    :param dict[str]|Util.CollectionReadCheckCovered opts:
+    :param list[int] seq_order: list of seq idxs
+    :param ((int)->int) get_seq_len: seq idx -> len
+    :param str debug_msg_prefix:
+    :return: new seq_order
+    :rtype: list[int]
+    """
+    import Util
+    if not isinstance(opts, Util.CollectionReadCheckCovered):
+      opts = Util.CollectionReadCheckCovered(opts)
+    if opts.get("max_mean_len"):
+      max_mean_len = opts.get("max_mean_len")
+      lens_and_seqs = numpy.array(sorted([(get_seq_len(idx), idx) for idx in seq_order]))
+      best_num = Util.binary_search_any(
+        cmp=lambda num: numpy.mean(lens_and_seqs[:num, 0]) - max_mean_len, low=1, high=len(lens_and_seqs) + 1)
+      assert best_num is not None
+      selected_seq_idxs = set(lens_and_seqs[:best_num, 1])
+      # Select subset of seq_order. Keep order as-is.
+      seq_order = [seq_idx for seq_idx in seq_order if seq_idx in selected_seq_idxs]
+      print(
+        ("%sOld mean seq len is %f, new is %f, requested max is %f."
+         " Old num seqs is %i, new num seqs is %i.") %
+        (debug_msg_prefix,
+         float(numpy.mean(lens_and_seqs[:, 0])), float(numpy.mean(lens_and_seqs[:best_num, 0])),
+         max_mean_len, len(lens_and_seqs), best_num),
+        file=log.v4)
+    opts.assert_all_read()
+    return seq_order
+
   def filter(self, epoch, seq_order, get_seq_len):
     """
     :param int|None epoch:
@@ -32,7 +77,6 @@ class EpochWiseFilter:
     :return: new seq_order
     """
     epoch = epoch or 1
-    import Util
     old_num_seqs = len(seq_order)
     any_filter = False
     for (ep_start, ep_end), value in sorted(self.epochs_opts.items()):
@@ -44,24 +88,9 @@ class EpochWiseFilter:
       assert isinstance(value, dict)
       if ep_start <= epoch <= ep_end:
         any_filter = True
-        opts = Util.CollectionReadCheckCovered(value)
-        if opts.get("max_mean_len"):
-          max_mean_len = opts.get("max_mean_len")
-          lens_and_seqs = numpy.array(sorted([(get_seq_len(idx), idx) for idx in seq_order]))
-          best_num = Util.binary_search_any(
-            cmp=lambda num: numpy.mean(lens_and_seqs[:num, 0]) - max_mean_len, low=1, high=len(lens_and_seqs) + 1)
-          assert best_num is not None
-          selected_seq_idxs = set(lens_and_seqs[:best_num, 1])
-          # Select subset of seq_order. Keep order as-is.
-          seq_order = [seq_idx for seq_idx in seq_order if seq_idx in selected_seq_idxs]
-          print(
-            ("%s, epoch %i. Old mean seq len is %f, new is %f, requested max is %f."
-             " Old num seqs is %i, new num seqs is %i.") %
-            (self.debug_msg_prefix, epoch,
-             float(numpy.mean(lens_and_seqs[:, 0])), float(numpy.mean(lens_and_seqs[:best_num, 0])),
-             max_mean_len, len(lens_and_seqs), best_num),
-            file=log.v4)
-        opts.assert_all_read()
+        seq_order = self.filter_epoch(
+          opts=value, debug_msg_prefix="%s, epoch %i. " % (self.debug_msg_prefix, epoch),
+          seq_order=seq_order, get_seq_len=get_seq_len)
     if any_filter:
       print("%s, epoch %i. Old num seqs %i, new num seqs %i." % (
         self.debug_msg_prefix, epoch, old_num_seqs, len(seq_order)), file=log.v4)
@@ -72,9 +101,55 @@ class EpochWiseFilter:
 
 class MetaDataset(CachedDataset2):
   """
-  This wraps around one or multiple datasets and might provide extra information.
-  Every dataset is expected to provide the the same sequences, where the sequence list
-  is given by a file.
+  The MetaDataset is to be used in the case of **Multimodality**.
+  Here, the datasets are expected to describe different features of the **same training sequences**.
+  These features will all be available to the network at the same time.
+
+  The datasets to be combined are given via the input parameter ``"datasets"``.
+  To define which training examples from the different datasets belong together, a ``"seq_list_file"`` in pickle format has to be created.
+  It contains a list of sequence tags for each dataset (see example below).
+  Note, that in general each dataset type has its own tag format, e.g. for the TranslationDataset it is ``line-<n>``, for the SprintDataset it is ``<corpusname>/<recording>/<segment id>``.
+  **Providing a sequence list can be omitted**, if the set of sequence tags is the same for all datasets.
+  When using multiple ExternSprintDataset instances, the sprint segment file can be provided as sequence list.
+  In this case the MetaDataset assumes that the sequences with equal tag correspond to each other.
+  This e.g. works when combining TranslationDatasets if all the text files are sentence aligned.
+
+
+  **Example of Sequence List:**
+
+  .. code::
+
+      { 'sprint': [
+          'corpus/ted_1/1',
+          'corpus/ted_1/2',
+          'corpus/ted_1/3',
+          'corpus/ted_1/4',
+      'translation': [
+          'line-0',
+          'line-1',
+          'line-2',
+          'line-3']
+      }
+
+  Python dict stored in pickle file. E.g. the sequence tagged with 'corpus/ted_1/3' in the 'sprint' dataset corresponds to the sequence tagged 'line-2'
+  in the 'translation' dataset.
+
+  **Example of MetaDataset config:**
+
+  .. code::
+
+      train = {"class": "MetaDataset", "seq_list_file": "seq_list.pkl",
+               "datasets": {"sprint": train_sprint, "translation": train_translation},
+               "data_map": {"data": ("sprint", "data"),
+               "target_text_sprint": ("sprint", "orth_classes"),
+               "source_text": ("translation", "data"),
+               "target_text": ("translation", "classes")},
+               "seq_ordering": "random",
+               "partition_epoch": 2,
+      }
+
+  This combines a SprintDataset and a TranslationDataset. These are defined as ``"train_sprint"`` and ``"train_translation"`` separately.
+  *Note that the current implementation expects one input feature to be called "data".*
   """
 
   def __init__(self,
@@ -183,6 +258,9 @@ class MetaDataset(CachedDataset2):
       if seq_list_file.endswith(".pkl"):
         import pickle
         seq_list = pickle.load(open(seq_list_file, 'rb'))
+      elif seq_list_file.endswith(".gz"):
+        import gzip
+        seq_list = gzip.open(seq_list_file, "rt").read().splitlines()
       else:
         seq_list = open(seq_list_file).read().splitlines()
     else:
@@ -552,9 +630,36 @@ class ConcatDataset(CachedDataset2):
 
 class CombinedDataset(CachedDataset2):
   """
-  This combines multiple different datasets, which provide different data-sources.
-  E.g. one can provide am-dataset with data:acoustic-features -> classes:characters (acoustic model train data),
-  and lm-dataset provides just data:characters (language model train data).
+  The CombinedDataset is to be used in the cases of **Multi-Task Learning** and **Combination of Corpora**.
+  Here, in general, the datasets describe **different training sequences**.
+  For each sequence, only the features of the corresponding dataset will be available.
+  Features of the other datasets are set to empty arrays.
+  The input parameter ``"datasets"`` is the same as for the MetaDataset.
+  The ``"data_map"`` is reversed to allow for several datasets mapping to the same feature.
+  The ``"default"`` ``"seq_ordering"`` is to first go through all sequences of the first dataset, then the second and so on.
+  All other sequence orderings (``"random"``, ``"sorted"``, ``"laplace"``, ...) are supported and based on this "default" ordering.
+  There is a special sequence ordering ``"random_dataset"``, where we pick datasets at random, while keeping the sequence order within the datasets as is.
+  To adjust the ratio of number of training examples from the different datasets in an epoch one can use ``"repeat_epoch"`` in some of the datasets to
+  increase their size relative to the others.
+  Also, ``"partition_epoch"`` in some of the datasets can be used to shrink them relative to the others.
+
+  **Example of CombinedDataset config:**
+
+  .. code::
+
+      train = {"class": "CombinedDataset",
+               "datasets": {"sprint": train_sprint, "translation": train_translation},
+               "data_map": {("sprint", "data"): "data",
+                            ("sprint", "orth_classes"): "orth_classes",
+                            ("translation", "data"): "source_text",
+                            ("translation", "classes"): "orth_classes"},
+               "seq_ordering": "default",
+               "partition_epoch": 2,
+       }
+
+  This combines a SprintDataset and a TranslationDataset. These are defined as ``"train_sprint"`` and ``"train_translation"`` separately.
+  *Note that the current implementation expects one input feature to be called "data".*
+
   Note: The mapping has been inverted. We now expect (dataset-key, dataset-data-key) -> self-data-key
   am-dataset:data -> am-data, am-dataset:classes -> am-classes, lm-dataset:data -> lm-data.
   For each sequence idx, it will select one of the given datasets, fill in the data-keys of this dataset

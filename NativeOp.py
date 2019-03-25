@@ -4574,3 +4574,841 @@ class SegmentFastBaumWelchOp(NativeOpGenBase):
 
     self.c_fw_code = '\n'.join(extra_lines) + '\n' + self.c_fw_code
 
+
+class EditDistanceOp(NativeOpGenBase):
+  """
+  Similar to :func:`tf.edit_distance`.
+  Calculates the `edit distance / Levenshtein distance <https://en.wikipedia.org/wiki/Levenshtein_distance>`__.
+
+  The naive implementation either goes over ``a`` and then ``b``, thus results in O(|a|*|b|) time complexity.
+  To calculate a new entry in the table (over then length of ``a`` and ``b``),
+  it depends on the prev symbol in ``a`` (left) (deletion error),
+  the prev symbol in ``b`` (up) (insertion error),
+  and the left-up diagonal (substitution error, or no error).
+
+  To take advantage of the parallelism of the GPU, we follow a diagonal iteration scheme, such that
+  in every iteration, all entries on the diagonal can be computed in parallel, as they do not depend on each other.
+  After implementing this, we found that this algorithm is described here::
+
+    Using GPUs to Speed-Up Levenshtein Edit Distance Computation, Balhaf et al, 2016,
+    https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=7476090&tag=1
+
+  inputs:
+    :param a: symbols. 2d (batch,time), int32
+    :param a_len: 1d (batch,), int32
+    :param b: symbols. 2d (batch,time), int32
+    :param b_len: 1d (batch,), int32
+  outputs:
+    :param output: 1d (batch,), int32, unnormalized edit distance
+  """
+  in_info = (
+    {"name": "a", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "a_len", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b_len", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+  )
+  out_info = (
+    {"name": "output", "ndim": 1, "shape": ((0, 0),), "dtype": "int32", "need_contiguous": True},
+  )
+
+  c_extra_support_code = {
+    "001_next_step": """
+      DEF_KERNEL
+      void next_step_kernel(
+            int n_batch, int n_a_max_len, int n_b_max_len,
+            int diag_idx,
+            const int32_t* a, const int32_t* b,
+            const int32_t* a_len, const int32_t* b_len,
+            const int32_t* last1_dist, const int32_t* last2_dist, int32_t* cur_dist,
+            int32_t* result) {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        // We are going diagonal!
+        int num_entries;
+        if(diag_idx <= n_a_max_len) {
+          num_entries = diag_idx + 1;
+          if(num_entries > n_b_max_len + 1)
+            num_entries = n_b_max_len + 1;
+        } else {
+          num_entries = n_b_max_len + 1 - (diag_idx - n_a_max_len);
+          if(num_entries > n_a_max_len + 1)
+            num_entries = n_a_max_len + 1;
+        }
+        int max_num_entries = n_a_max_len + 1;
+        if(max_num_entries > n_b_max_len + 1)
+          max_num_entries = n_b_max_len + 1;
+        while(idx < n_batch * num_entries) {
+          int batch_idx = idx / num_entries;
+          int entry_idx = idx % num_entries;
+          int dist_idx = batch_idx * max_num_entries + entry_idx;
+
+          int t_a, t_b;
+          if(diag_idx <= n_a_max_len) {
+            t_a = diag_idx - entry_idx;
+            t_b = entry_idx;
+          } else {
+            t_a = n_a_max_len - entry_idx;
+            t_b = diag_idx - n_a_max_len + entry_idx;
+          }
+
+          if(t_a == 0)
+            cur_dist[dist_idx] = t_b;  // distance == how much to delete from b
+          else if(t_b == 0)
+            cur_dist[dist_idx] = t_a;  // distance == how much to delete from a
+          else {
+            // last1 is with diag_idx - 2. Needed for substitution cost.
+            // last2 is with diag_idx - 1. Needed for insertion or deletion cost.
+            // last2 refers to the first, for deletion. last2_idx + 1 is for insertion.
+            int last1_idx, last2_idx;
+            if(diag_idx - 1 < n_a_max_len)
+              last1_idx = dist_idx - 1;
+            else if(diag_idx - 1 == n_a_max_len)
+              last1_idx = dist_idx;
+            else
+              last1_idx = dist_idx + 1;
+            if(diag_idx <= n_a_max_len)
+              last2_idx = dist_idx - 1;
+            else
+              last2_idx = dist_idx;
+
+            int del_cost, ins_cost, sub_cost;
+            del_cost = last2_dist[last2_idx] + 1;
+            ins_cost = last2_dist[last2_idx + 1] + 1;
+            sub_cost = last1_dist[last1_idx];
+            if(a[batch_idx * n_a_max_len + t_a - 1] != b[batch_idx * n_b_max_len + t_b - 1])
+              ++sub_cost;
+            //printf("t_a %i, t_b %i, del %i, ins %i, sub %i\\n", t_a, t_b, del_cost, ins_cost, sub_cost);
+            int min_cost = del_cost;
+            if(min_cost > ins_cost) min_cost = ins_cost;
+            if(min_cost > sub_cost) min_cost = sub_cost;
+            cur_dist[dist_idx] = min_cost;
+          }
+          //printf("t_a %i, t_b %i, dist %i\\n", t_a, t_b, cur_dist[dist_idx]);
+
+          if(t_a == a_len[batch_idx] && t_b == b_len[batch_idx])
+            result[batch_idx] = cur_dist[dist_idx];
+
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """
+  }
+
+  c_fw_code = """
+    assert(n_inputs == 4);
+    assert(n_outputs == 1);
+    Ndarray* a = inputs[0];
+    Ndarray* a_len = inputs[1];
+    Ndarray* b = inputs[2];
+    Ndarray* b_len = inputs[3];
+    Ndarray* out = *outputs[0];
+    assert_cmp(Ndarray_NDIM(a), ==, 2);
+    assert_cmp(Ndarray_NDIM(a_len), ==, 1);
+    assert_cmp(Ndarray_NDIM(b), ==, 2);
+    assert_cmp(Ndarray_NDIM(b_len), ==, 1);
+    assert_cmp(Ndarray_NDIM(out), ==, 1);
+    int n_batch = Ndarray_DIMS(out)[0];
+    assert_cmp(Ndarray_DIMS(a)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(a_len)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b_len)[0], ==, n_batch);
+    int n_a_max_len = Ndarray_DIMS(a)[1];
+    int n_b_max_len = Ndarray_DIMS(b)[1];
+    Ndarray_memset(Ndarray_DEV_DATA_int32(out), 255, n_batch * sizeof(int32_t));
+
+    // Working buffer.
+    int max_num_entries = std::min(n_a_max_len + 1, n_b_max_len + 1);
+    int32_t* buffer = (int32_t*) device_malloc(3 * n_batch * max_num_entries * sizeof(int32_t));
+    int32_t* last1_dist = buffer;
+    int32_t* last2_dist = buffer + n_batch * max_num_entries;
+    int32_t* cur_dist = buffer + 2 * n_batch * max_num_entries;
+
+    int num_diag = n_a_max_len + n_b_max_len + 1;
+    for(int diag_idx = 0; diag_idx < num_diag; ++diag_idx) {
+      start_dev_kernel(next_step_kernel, (
+        n_batch, n_a_max_len, n_b_max_len,
+        diag_idx,
+        Ndarray_DEV_DATA_int32(a), Ndarray_DEV_DATA_int32(b),
+        Ndarray_DEV_DATA_int32(a_len), Ndarray_DEV_DATA_int32(b_len),
+        last1_dist, last2_dist, cur_dist,
+        Ndarray_DEV_DATA_int32(out)));
+      // Rotate. last1_dist not needed anymore.
+      int32_t* tmp = last1_dist;
+      last1_dist = last2_dist;
+      last2_dist = cur_dist;
+      cur_dist = tmp;
+    }
+
+    device_free(buffer);
+  """
+
+  c_bw_code = None
+
+
+class OptimalCompletionEditDistanceOp(NativeOpGenBase):
+  """
+  Given some prefix ``a``, what is the minimum possible edit distance to ``b`` with any possible suffix on ``a`` ?
+  This is described in `Optimal Completion Distillation (OCD) <https://arxiv.org/abs/1810.01398>`__.
+  The implementation is derived from :class:`EditDistanceOp`.
+
+  inputs:
+    :param a: symbols. 2d (batch,time), int32. prefix.
+    :param a_len: 1d (batch,), int32
+    :param b: symbols. 2d (batch,time), int32
+    :param b_len: 1d (batch,), int32
+  outputs:
+    :param output: 1d (batch,), int32, unnormalized edit distance
+  """
+  in_info = (
+    {"name": "a", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "a_len", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b_len", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+  )
+  out_info = (
+    {"name": "output", "ndim": 1, "shape": ((0, 0),), "dtype": "int32", "need_contiguous": True},
+  )
+
+  c_extra_support_code = {
+    "001_init_result": """
+      DEF_KERNEL
+      void init_result_kernel(int n_batch, int32_t* result) {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        while(idx < n_batch) {
+          result[idx] = 2147483647;  // biggest int32
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """,
+    "002_next_step": """
+      DEF_KERNEL
+      void next_step_kernel(
+            int n_batch, int n_a_max_len, int n_b_max_len,
+            int diag_idx,
+            const int32_t* a, const int32_t* b,
+            const int32_t* a_len, const int32_t* b_len,
+            const int32_t* last1_dist, const int32_t* last2_dist, int32_t* cur_dist,
+            int32_t* result) {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        // We are going diagonal!
+        int num_entries;
+        if(diag_idx <= n_a_max_len) {
+          num_entries = diag_idx + 1;
+          if(num_entries > n_b_max_len + 1)
+            num_entries = n_b_max_len + 1;
+        } else {
+          num_entries = n_b_max_len + 1 - (diag_idx - n_a_max_len);
+          if(num_entries > n_a_max_len + 1)
+            num_entries = n_a_max_len + 1;
+        }
+        int max_num_entries = n_a_max_len + 1;
+        if(max_num_entries > n_b_max_len + 1)
+          max_num_entries = n_b_max_len + 1;
+        while(idx < n_batch * num_entries) {
+          int batch_idx = idx / num_entries;
+          int entry_idx = idx % num_entries;
+          int dist_idx = batch_idx * max_num_entries + entry_idx;
+
+          int t_a, t_b;
+          if(diag_idx <= n_a_max_len) {
+            t_a = diag_idx - entry_idx;
+            t_b = entry_idx;
+          } else {
+            t_a = n_a_max_len - entry_idx;
+            t_b = diag_idx - n_a_max_len + entry_idx;
+          }
+
+          if(t_a == 0)
+            cur_dist[dist_idx] = t_b;  // distance == how much to delete from b
+          else if(t_b == 0)
+            cur_dist[dist_idx] = t_a;  // distance == how much to delete from a
+          else {
+            // last1 is with diag_idx - 2. Needed for substitution cost.
+            // last2 is with diag_idx - 1. Needed for insertion or deletion cost.
+            // last2 refers to the first, for deletion. last2_idx + 1 is for insertion.
+            int last1_idx, last2_idx;
+            if(diag_idx - 1 < n_a_max_len)
+              last1_idx = dist_idx - 1;
+            else if(diag_idx - 1 == n_a_max_len)
+              last1_idx = dist_idx;
+            else
+              last1_idx = dist_idx + 1;
+            if(diag_idx <= n_a_max_len)
+              last2_idx = dist_idx - 1;
+            else
+              last2_idx = dist_idx;
+
+            int del_cost, ins_cost, sub_cost;
+            del_cost = last2_dist[last2_idx] + 1;
+            ins_cost = last2_dist[last2_idx + 1] + 1;
+            sub_cost = last1_dist[last1_idx];
+            if(a[batch_idx * n_a_max_len + t_a - 1] != b[batch_idx * n_b_max_len + t_b - 1])
+              ++sub_cost;
+            int min_cost = del_cost;
+            if(min_cost > ins_cost) min_cost = ins_cost;
+            if(min_cost > sub_cost) min_cost = sub_cost;
+            cur_dist[dist_idx] = min_cost;
+          }
+
+          if(t_a == a_len[batch_idx] && t_b <= b_len[batch_idx])
+            elem_atomic_min(&result[batch_idx], cur_dist[dist_idx]);
+
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """
+  }
+
+  c_fw_code = """
+    assert(n_inputs == 4);
+    assert(n_outputs == 1);
+    Ndarray* a = inputs[0];
+    Ndarray* a_len = inputs[1];
+    Ndarray* b = inputs[2];
+    Ndarray* b_len = inputs[3];
+    Ndarray* out = *outputs[0];
+    assert_cmp(Ndarray_NDIM(a), ==, 2);
+    assert_cmp(Ndarray_NDIM(a_len), ==, 1);
+    assert_cmp(Ndarray_NDIM(b), ==, 2);
+    assert_cmp(Ndarray_NDIM(b_len), ==, 1);
+    assert_cmp(Ndarray_NDIM(out), ==, 1);
+    int n_batch = Ndarray_DIMS(out)[0];
+    assert_cmp(Ndarray_DIMS(a)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(a_len)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b_len)[0], ==, n_batch);
+    int n_a_max_len = Ndarray_DIMS(a)[1];
+    int n_b_max_len = Ndarray_DIMS(b)[1];
+    start_dev_kernel(init_result_kernel, (n_batch, Ndarray_DEV_DATA_int32(out)));
+
+    // Working buffer.
+    int max_num_entries = std::min(n_a_max_len + 1, n_b_max_len + 1);
+    int32_t* buffer = (int32_t*) device_malloc(3 * n_batch * max_num_entries * sizeof(int32_t));
+    int32_t* last1_dist = buffer;
+    int32_t* last2_dist = buffer + n_batch * max_num_entries;
+    int32_t* cur_dist = buffer + 2 * n_batch * max_num_entries;
+
+    int num_diag = n_a_max_len + n_b_max_len + 1;
+    for(int diag_idx = 0; diag_idx < num_diag; ++diag_idx) {
+      start_dev_kernel(next_step_kernel, (
+        n_batch, n_a_max_len, n_b_max_len,
+        diag_idx,
+        Ndarray_DEV_DATA_int32(a), Ndarray_DEV_DATA_int32(b),
+        Ndarray_DEV_DATA_int32(a_len), Ndarray_DEV_DATA_int32(b_len),
+        last1_dist, last2_dist, cur_dist,
+        Ndarray_DEV_DATA_int32(out)));
+      // Rotate. last1_dist not needed anymore.
+      int32_t* tmp = last1_dist;
+      last1_dist = last2_dist;
+      last2_dist = cur_dist;
+      cur_dist = tmp;
+    }
+
+    device_free(buffer);
+  """
+
+  c_bw_code = None
+
+
+class OptimalCompletionEditDistancePerSuccessorOp(NativeOpGenBase):
+  """
+  Given some prefix ``a`` + successor,
+  what is the minimum possible edit distance to ``b`` with any possible suffix on ``a`` + successor,
+  for successor in ``successors``.
+  This is described in `Optimal Completion Distillation (OCD) <https://arxiv.org/abs/1810.01398>`__.
+  The implementation is derived from :class:`OptimalCompletionEditDistanceOp`.
+
+  inputs:
+    :param a: symbols. 2d (batch,time), int32. prefix.
+    :param a_len: 1d (batch,), int32
+    :param b: symbols. 2d (batch,time), int32
+    :param b_len: 1d (batch,), int32
+    :param successors: 1d (num_labels,), int32
+  outputs:
+    :param output: 2d (batch,num_labels), int32, unnormalized edit distance
+  """
+  in_info = (
+    {"name": "a", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "a_len", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b_len", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "successors", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+  )
+  out_info = (
+    {"name": "output", "ndim": 2, "shape": ((0, 0), (4, 0)), "dtype": "int32", "need_contiguous": True},
+  )
+
+  c_extra_support_code = {
+    "001_next_step": """
+      DEF_KERNEL
+      void next_step_kernel(
+            int n_batch, int n_a_max_len, int n_b_max_len,
+            int diag_idx,
+            const int32_t* a, const int32_t* b,
+            const int32_t* a_len, const int32_t* b_len,
+            const int32_t* last1_dist, const int32_t* last2_dist, int32_t* cur_dist, int32_t* a_last_row) {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        // We are going diagonal!
+        int num_entries;
+        if(diag_idx <= n_a_max_len) {
+          num_entries = diag_idx + 1;
+          if(num_entries > n_b_max_len + 1)
+            num_entries = n_b_max_len + 1;
+        } else {
+          num_entries = n_b_max_len + 1 - (diag_idx - n_a_max_len);
+          if(num_entries > n_a_max_len + 1)
+            num_entries = n_a_max_len + 1;
+        }
+        int max_num_entries = n_a_max_len + 1;
+        if(max_num_entries > n_b_max_len + 1)
+          max_num_entries = n_b_max_len + 1;
+        while(idx < n_batch * num_entries) {
+          int batch_idx = idx / num_entries;
+          int entry_idx = idx % num_entries;
+          int dist_idx = batch_idx * max_num_entries + entry_idx;
+
+          int t_a, t_b;
+          if(diag_idx <= n_a_max_len) {
+            t_a = diag_idx - entry_idx;
+            t_b = entry_idx;
+          } else {
+            t_a = n_a_max_len - entry_idx;
+            t_b = diag_idx - n_a_max_len + entry_idx;
+          }
+
+          if(t_a == 0)
+            cur_dist[dist_idx] = t_b;  // distance == how much to delete from b
+          else if(t_b == 0)
+            cur_dist[dist_idx] = t_a;  // distance == how much to delete from a
+          else {
+            // last1 is with diag_idx - 2. Needed for substitution cost.
+            // last2 is with diag_idx - 1. Needed for insertion or deletion cost.
+            // last2 refers to the first, for deletion. last2_idx + 1 is for insertion.
+            int last1_idx, last2_idx;
+            if(diag_idx - 1 < n_a_max_len)
+              last1_idx = dist_idx - 1;
+            else if(diag_idx - 1 == n_a_max_len)
+              last1_idx = dist_idx;
+            else
+              last1_idx = dist_idx + 1;
+            if(diag_idx <= n_a_max_len)
+              last2_idx = dist_idx - 1;
+            else
+              last2_idx = dist_idx;
+
+            int del_cost, ins_cost, sub_cost;
+            del_cost = last2_dist[last2_idx] + 1;
+            ins_cost = last2_dist[last2_idx + 1] + 1;
+            sub_cost = last1_dist[last1_idx];
+            if(a[batch_idx * n_a_max_len + t_a - 1] != b[batch_idx * n_b_max_len + t_b - 1])
+              ++sub_cost;
+            int min_cost = del_cost;
+            if(min_cost > ins_cost) min_cost = ins_cost;
+            if(min_cost > sub_cost) min_cost = sub_cost;
+            cur_dist[dist_idx] = min_cost;
+          }
+
+          if(t_a == a_len[batch_idx] && t_b <= b_len[batch_idx])
+            a_last_row[batch_idx * (n_b_max_len + 1) + t_b] = cur_dist[dist_idx];
+
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """,
+    "002_init_result": """
+      DEF_KERNEL
+      void init_result_kernel(
+            int n_batch, int n_b_max_len, int n_labels,
+            const int32_t* a_len, const int32_t* b_len,
+            const int32_t* a_last_row,
+            int32_t* result
+      ) {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        while(idx < n_batch * n_labels) {
+          int batch_idx = idx / n_labels;
+          int successor_idx = idx % n_labels;
+
+          // Initial insertion, last deletion.
+          int t_a = a_len[batch_idx] + 1;
+          int min_cost = t_a;
+          int last_del_cost = a_last_row[batch_idx * (n_b_max_len + 1) + b_len[batch_idx]] + 1;
+          if(min_cost > last_del_cost) min_cost = last_del_cost;
+          result[batch_idx * n_labels + successor_idx] = min_cost;
+
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """,
+    "003_expand": """
+      DEF_KERNEL
+      void expand_kernel(
+            int n_batch, int n_b_max_len, int n_labels,
+            const int32_t* b,
+            const int32_t* b_len,
+            const int32_t* a_last_row,
+            const int32_t* successors,
+            int32_t* result
+      ) {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        while(idx < n_batch * n_labels * n_b_max_len) {
+          int batch_idx = idx / n_b_max_len / n_labels;
+          int successor_idx = (idx / n_b_max_len) % n_labels;
+          int t_b = idx % n_b_max_len;
+          int successor = successors[successor_idx];
+
+          if(t_b < b_len[batch_idx]) {
+            // We can ignore insertion/deletion
+            // (except initial insertion / last deletion, see init_result_kernel).
+            int sub_cost = a_last_row[batch_idx * (n_b_max_len + 1) + t_b];
+            if(successor != b[batch_idx * n_b_max_len + t_b])
+              ++sub_cost;
+            elem_atomic_min(&result[batch_idx * n_labels + successor_idx], sub_cost);
+          }
+
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """
+  }
+
+  c_fw_code = """
+    assert(n_inputs == 5);
+    assert(n_outputs == 1);
+    Ndarray* a = inputs[0];
+    Ndarray* a_len = inputs[1];
+    Ndarray* b = inputs[2];
+    Ndarray* b_len = inputs[3];
+    Ndarray* successors = inputs[4];
+    Ndarray* out = *outputs[0];
+    assert_cmp(Ndarray_NDIM(a), ==, 2);
+    assert_cmp(Ndarray_NDIM(a_len), ==, 1);
+    assert_cmp(Ndarray_NDIM(b), ==, 2);
+    assert_cmp(Ndarray_NDIM(b_len), ==, 1);
+    assert_cmp(Ndarray_NDIM(successors), ==, 1);
+    assert_cmp(Ndarray_NDIM(out), ==, 2);
+    int n_batch = Ndarray_DIMS(out)[0];
+    int n_labels = Ndarray_DIMS(successors)[0];
+    assert_cmp(Ndarray_DIMS(out)[1], ==, n_labels);
+    assert_cmp(Ndarray_DIMS(a)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(a_len)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b_len)[0], ==, n_batch);
+    int n_a_max_len = Ndarray_DIMS(a)[1];
+    int n_b_max_len = Ndarray_DIMS(b)[1];
+    Ndarray_memset(Ndarray_DEV_DATA_int32(out), 255, n_batch * n_labels * sizeof(int32_t));
+
+    // Working buffer.
+    int max_num_entries = std::min(n_a_max_len + 1, n_b_max_len + 1);
+    int32_t* buffer = (int32_t*) device_malloc(3 * n_batch * max_num_entries * sizeof(int32_t));
+    int32_t* last1_dist = buffer;
+    int32_t* last2_dist = buffer + n_batch * max_num_entries;
+    int32_t* cur_dist = buffer + 2 * n_batch * max_num_entries;
+    int32_t* a_last_row = (int32_t*) device_malloc(n_batch * (n_b_max_len + 1) * sizeof(int32_t));
+
+    int num_diag = n_a_max_len + n_b_max_len + 1;
+    for(int diag_idx = 0; diag_idx < num_diag; ++diag_idx) {
+      start_dev_kernel(next_step_kernel, (
+        n_batch, n_a_max_len, n_b_max_len,
+        diag_idx,
+        Ndarray_DEV_DATA_int32(a), Ndarray_DEV_DATA_int32(b),
+        Ndarray_DEV_DATA_int32(a_len), Ndarray_DEV_DATA_int32(b_len),
+        last1_dist, last2_dist, cur_dist, a_last_row
+      ));
+      // Rotate. last1_dist not needed anymore.
+      int32_t* tmp = last1_dist;
+      last1_dist = last2_dist;
+      last2_dist = cur_dist;
+      cur_dist = tmp;
+    }
+
+    start_dev_kernel(init_result_kernel, (
+      n_batch, n_b_max_len, n_labels,
+      Ndarray_DEV_DATA_int32(a_len), Ndarray_DEV_DATA_int32(b_len),
+      a_last_row,
+      Ndarray_DEV_DATA_int32(out)
+    ));
+
+    start_dev_kernel(expand_kernel, (
+      n_batch, n_b_max_len, n_labels,
+      Ndarray_DEV_DATA_int32(b),
+      Ndarray_DEV_DATA_int32(b_len),
+      a_last_row,
+      Ndarray_DEV_DATA_int32(successors),
+      Ndarray_DEV_DATA_int32(out)
+    ));
+
+    device_free(buffer);
+    device_free(a_last_row);
+  """
+
+  c_bw_code = None
+
+
+class NextEditDistanceRowOp(NativeOpGenBase):
+  """
+  This does a single step in calculating the edit distance table, going over the symbols in ``a``.
+  Note that when you have the full sequence ``a`` in advance, :class:`EditDistanceOp` should be faster.
+  However, this iterative op is useful when ``a`` is constructed step by step.
+
+  inputs:
+    :param last_row: 2d (batch,b_time + 1), int32. last edit distances
+    :param a: symbols. 1d (batch,), int32. current.
+    :param a_n: scalar, int32. current position
+    :param a_ended: 1d (batch,), int32 (casted from bool, because int32 easier to handle)
+    :param b: symbols. 2d (batch,b_time), int32
+    :param b_len: 1d (batch,), int32
+  outputs:
+    :param output: 2d (batch,b_time + 1), int32, next (unnormalized) edit distance row
+  """
+  in_info = (
+    {"name": "last_row", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "a", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "a_n", "ndim": 0, "shape": (), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "a_ended", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b_len", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+  )
+  out_info = (
+    {"name": "output", "ndim": 2, "shape": ((0, 0), (0, 1)), "dtype": "int32", "need_contiguous": True},
+  )
+
+  c_extra_support_code = {
+    "001_next_row": """
+      DEF_KERNEL
+      void next_row_kernel(
+            int n_batch, int n_b_max_len,
+            const int32_t* last_row,
+            const int32_t* a, const int32_t* a_n, const int32_t* a_ended,
+            const int32_t* b, const int32_t* b_len,
+            int32_t* next_row
+      ) {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        while(idx < n_batch) {
+          int batch_idx = idx;
+
+          int last_dist;
+          if(!a_ended[batch_idx]) {
+            last_dist = *a_n + 1;  // Initial deletion error.
+            next_row[batch_idx * (n_b_max_len + 1)] = last_dist;
+            for(int t_b = 1; t_b <= b_len[batch_idx]; ++t_b) {
+              int ins_error = last_row[batch_idx * (n_b_max_len + 1) + t_b] + 1;
+              int del_error = last_dist + 1;
+              int sub_error = last_row[batch_idx * (n_b_max_len + 1) + t_b - 1];
+              if(a[batch_idx] != b[batch_idx * n_b_max_len + t_b - 1])
+                ++sub_error;
+              last_dist = ins_error;
+              if(last_dist > del_error) last_dist = del_error;
+              if(last_dist > sub_error) last_dist = sub_error;
+              next_row[batch_idx * (n_b_max_len + 1) + t_b] = last_dist;
+            }
+          }
+          else {  // a ended
+            // Just copy over.
+            for(int t_b = 0; t_b <= b_len[batch_idx]; ++t_b) {
+              last_dist = last_row[batch_idx * (n_b_max_len + 1) + t_b];
+              next_row[batch_idx * (n_b_max_len + 1) + t_b] = last_dist;
+            }
+          }
+          // Repeat last entry.
+          for(int t_b = b_len[batch_idx] + 1; t_b < n_b_max_len + 1; ++t_b)
+            next_row[batch_idx * (n_b_max_len + 1) + t_b] = last_dist;
+
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """
+  }
+
+  c_fw_code = """
+    assert(n_inputs == 6);
+    assert(n_outputs == 1);
+    Ndarray* last_row = inputs[0];
+    Ndarray* a = inputs[1];
+    Ndarray* a_n = inputs[2];
+    Ndarray* a_ended = inputs[3];
+    Ndarray* b = inputs[4];
+    Ndarray* b_len = inputs[5];
+    Ndarray* out = *outputs[0];
+    assert_cmp(Ndarray_NDIM(last_row), ==, 2);
+    assert_cmp(Ndarray_NDIM(a), ==, 1);
+    assert_cmp(Ndarray_NDIM(a_n), ==, 0);
+    assert_cmp(Ndarray_NDIM(a_ended), ==, 1);
+    assert_cmp(Ndarray_NDIM(b), ==, 2);
+    assert_cmp(Ndarray_NDIM(b_len), ==, 1);
+    assert_cmp(Ndarray_NDIM(out), ==, 2);
+    int n_batch = Ndarray_DIMS(out)[0];
+    int n_b_max_len = Ndarray_DIMS(b)[1];
+    assert_cmp(Ndarray_DIMS(out)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(out)[1], ==, n_b_max_len + 1);
+    assert_cmp(Ndarray_DIMS(last_row)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(last_row)[1], ==, n_b_max_len + 1);
+    assert_cmp(Ndarray_DIMS(a)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(a_ended)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b)[1], ==, n_b_max_len);
+    assert_cmp(Ndarray_DIMS(b_len)[0], ==, n_batch);
+
+    start_dev_kernel(next_row_kernel, (
+      n_batch, n_b_max_len,
+      Ndarray_DEV_DATA_int32(last_row),
+      Ndarray_DEV_DATA_int32(a), Ndarray_DEV_DATA_int32(a_n), Ndarray_DEV_DATA_int32(a_ended),
+      Ndarray_DEV_DATA_int32(b), Ndarray_DEV_DATA_int32(b_len),
+      Ndarray_DEV_DATA_int32(out)
+    ));
+  """
+
+  c_bw_code = None
+
+
+class NextEditDistanceReduceOp(NativeOpGenBase):
+  """
+  Code derived from :class:`NextEditDistanceRowOp`.
+
+  inputs:
+    :param last_row: 2d (batch,b_time + 1), int32. last edit distances
+    :param a: symbols. 2d (batch|1,n_labels), int32. current.
+    :param a_n: scalar, int32. current position
+    :param a_ended: 1d (batch,), int32 (casted from bool, because int32 easier to handle)
+    :param b: symbols. 2d (batch,b_time), int32
+    :param b_len: 1d (batch,), int32
+    :param optimal_completion: scalar, int32 (casted from bool). True -> reduce_min over row; False -> last of row
+  outputs:
+    :param output: 2d (batch,n_labels), int32, next (unnormalized) (maybe optional) edit distance
+  """
+  in_info = (
+    {"name": "last_row", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "a", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "a_n", "ndim": 0, "shape": (), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "a_ended", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b", "ndim": 2, "shape": (None, None), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "b_len", "ndim": 1, "shape": (None,), "dtype": "int32",
+     "need_contiguous": True, "gradient": "disconnected"},
+    {"name": "optimal_completion", "ndim": 0, "shape": (), "dtype": "int32",
+     "gradient": "disconnected", "host_memory": True},
+  )
+  out_info = (
+    {"name": "output", "ndim": 2, "shape": ((0, 0), (1, 1)), "dtype": "int32", "need_contiguous": True},
+  )
+
+  c_extra_support_code = {
+    "001_calc_result": """
+      DEF_KERNEL
+      void calc_result_kernel(
+            int n_batch, int n_b_max_len, int n_labels,
+            const int32_t* last_row,
+            const int32_t* a, const int32_t* a_n, const int32_t* a_ended,
+            const int32_t* b, const int32_t* b_len,
+            int32_t* result,
+            bool optimal_completion,
+            bool a_broadcast_batch
+      ) {
+        int idx = threadIdx.x + blockDim.x * blockIdx.x;
+        while(idx < n_batch * n_labels) {
+          int batch_idx = idx / n_labels;
+          int label_idx = idx % n_labels;
+          int a_label = a[(a_broadcast_batch ? 0 : batch_idx) * n_labels + label_idx];
+
+          int total_min_error;
+          int last_dist;
+          if(!a_ended[batch_idx]) {
+            last_dist = *a_n + 1;  // Initial deletion error.
+            total_min_error = last_dist;
+            for(int t_b = 1; t_b <= b_len[batch_idx]; ++t_b) {
+              int ins_error = last_row[batch_idx * (n_b_max_len + 1) + t_b] + 1;
+              int del_error = last_dist + 1;
+              int sub_error = last_row[batch_idx * (n_b_max_len + 1) + t_b - 1];
+              if(a_label != b[batch_idx * n_b_max_len + t_b - 1])
+                ++sub_error;
+              int min_error = ins_error;
+              if(min_error > del_error) min_error = del_error;
+              if(min_error > sub_error) min_error = sub_error;
+              last_dist = min_error;
+              if(total_min_error > last_dist) total_min_error = last_dist;
+            }
+          }
+          else {  // a ended
+            // Just copy over.
+            total_min_error = last_row[batch_idx * (n_b_max_len + 1)];
+            for(int t_b = 0; t_b <= b_len[batch_idx]; ++t_b) {
+              last_dist = last_row[batch_idx * (n_b_max_len + 1) + t_b];
+              if(total_min_error > last_dist) total_min_error = last_dist;
+            }
+          }
+
+          result[batch_idx * n_labels + label_idx] = optimal_completion ? total_min_error : last_dist;
+
+          idx += gridDim.x * blockDim.x;
+        }
+      }
+    """
+  }
+
+  c_fw_code = """
+    assert(n_inputs == 7);
+    assert(n_outputs == 1);
+    Ndarray* last_row = inputs[0];
+    Ndarray* a = inputs[1];
+    Ndarray* a_n = inputs[2];
+    Ndarray* a_ended = inputs[3];
+    Ndarray* b = inputs[4];
+    Ndarray* b_len = inputs[5];
+    bool optimal_completion = (bool) Ndarray_DEV_DATA_int32_scalar(inputs[6]);
+    Ndarray* out = *outputs[0];
+    assert_cmp(Ndarray_NDIM(last_row), ==, 2);
+    assert_cmp(Ndarray_NDIM(a), ==, 2);
+    assert_cmp(Ndarray_NDIM(a_n), ==, 0);
+    assert_cmp(Ndarray_NDIM(a_ended), ==, 1);
+    assert_cmp(Ndarray_NDIM(b), ==, 2);
+    assert_cmp(Ndarray_NDIM(b_len), ==, 1);
+    assert_cmp(Ndarray_NDIM(out), ==, 2);
+    int n_batch = Ndarray_DIMS(out)[0];
+    int n_labels = Ndarray_DIMS(out)[1];
+    int n_b_max_len = Ndarray_DIMS(b)[1];
+    assert_cmp(Ndarray_DIMS(out)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(out)[1], ==, n_labels);
+    assert_cmp(Ndarray_DIMS(last_row)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(last_row)[1], ==, n_b_max_len + 1);
+    bool a_broadcast_batch = Ndarray_DIMS(a)[0] == 1;
+    if(!a_broadcast_batch)
+      assert_cmp(Ndarray_DIMS(a)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(a)[1], ==, n_labels);
+    assert_cmp(Ndarray_DIMS(a_ended)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b)[0], ==, n_batch);
+    assert_cmp(Ndarray_DIMS(b)[1], ==, n_b_max_len);
+    assert_cmp(Ndarray_DIMS(b_len)[0], ==, n_batch);
+
+    start_dev_kernel(calc_result_kernel, (
+      n_batch, n_b_max_len, n_labels,
+      Ndarray_DEV_DATA_int32(last_row),
+      Ndarray_DEV_DATA_int32(a), Ndarray_DEV_DATA_int32(a_n), Ndarray_DEV_DATA_int32(a_ended),
+      Ndarray_DEV_DATA_int32(b), Ndarray_DEV_DATA_int32(b_len),
+      Ndarray_DEV_DATA_int32(out),
+      optimal_completion,
+      a_broadcast_batch
+    ));
+  """
+
+  c_bw_code = None

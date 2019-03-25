@@ -190,6 +190,7 @@ class TFNetwork(object):
   def __init__(self, config=None, extern_data=None, rnd_seed=None,
                train_flag=False, eval_flag=False, search_flag=False,
                parent_layer=None, parent_net=None, extra_parent_net=None,
+               is_inside_rec_layer=None,
                name=None):
     """
     :param Config.Config config: only needed to init extern_data if not specified explicitly
@@ -201,6 +202,7 @@ class TFNetwork(object):
     :param TFNetworkLayer.LayerBase|None parent_layer:
     :param TFNetwork|None parent_net:
     :param TFNetwork|None extra_parent_net:
+    :param bool is_inside_rec_layer: at template construction, use this
     :param str name: only for debugging
     """
     if not name:
@@ -236,6 +238,7 @@ class TFNetwork(object):
     self.search_flag = search_flag
     self.parent_layer = parent_layer
     self.parent_net = parent_net
+    self._is_inside_rec_layer = is_inside_rec_layer
     self.extra_parent_net = extra_parent_net
     self.extra_net = None  # type: TFNetwork
     self._selected_train_layers = None
@@ -348,7 +351,9 @@ class TFNetwork(object):
         continue
       if layer_desc.get("only_on_eval") and not self.eval_flag:
         continue
-      if name == "output" or "target" in layer_desc or "loss" in layer_desc or layer_desc.get("is_output_layer", False):
+      if (name == "output"
+              or layer_desc.get("loss", None)
+              or layer_desc.get("is_output_layer", False)):
         self.construct_layer(net_dict, name)
     assert not self._constructing_layers
 
@@ -375,6 +380,9 @@ class TFNetwork(object):
       # However, any dependencies might resolve to the main net.
       self.extra_net.construct_layer(net_dict=net_dict, name=layer_name, check_existing=False)
 
+    if self.extra_net.recurrent:
+      self.recurrent = True
+
   def construct_layer(self, net_dict, name, get_layer=None, add_layer=None, check_existing=True):
     """
     :param dict[str,dict[str]] net_dict:
@@ -389,7 +397,7 @@ class TFNetwork(object):
     """
     if name in self.layers:
       return self.layers[name]
-    if check_existing:
+    if check_existing and name != "data" and not name.startswith("data:"):
       try:
         return self.get_layer(name)
       except LayerNotFound:
@@ -463,6 +471,7 @@ class TFNetwork(object):
     """
     from pprint import pprint
     from Util import help_on_type_error_wrong_args
+    from TFUtil import py_print
     layer_desc = self._create_layer_layer_desc(name=name, layer_desc=layer_desc)
     debug_print_layer_output_template = self.get_config().bool("debug_print_layer_output_template", False)
     debug_print_layer_output_shape = self.get_config().bool("debug_print_layer_output_shape", False)
@@ -488,8 +497,9 @@ class TFNetwork(object):
         pprint(layer_desc)
         raise
       if debug_print_layer_output_shape:
-        layer.output.placeholder = tf.Print(
-          layer.output.placeholder, [layer_class.cls_get_tf_scope_name(name), "shape:", tf.shape(layer.output.placeholder)],
+        layer.output.placeholder = py_print(
+          layer.output.placeholder,
+          [layer_class.cls_get_tf_scope_name(name), "shape:", str(layer.output), tf.shape(layer.output.placeholder)],
           summarize=10, name="debug_print_layer_output_shape")
       if debug_add_check_numerics_on_output and layer.output.dtype.startswith("float") and not layer.allow_inf_in_output:
         print("debug_add_check_numerics_on_output: add for layer %r: %r" % (name, layer.output.placeholder))
@@ -531,6 +541,8 @@ class TFNetwork(object):
     :param bool mark_data_key_as_used:
     :rtype: Data
     """
+    if key in {"seq_idx", "seq_tag"} and self.parent_net:
+      return self.parent_net.get_extern_data(key, mark_data_key_as_used=mark_data_key_as_used)
     if mark_data_key_as_used:
       self.used_data_keys.add(key)
     if key == "seq_idx" and key not in self.extern_data.data:
@@ -720,6 +732,9 @@ class TFNetwork(object):
       if not self.parent_net:
         raise LayerNotFound("cannot get layer %r, no parent net for %r" % (layer_name, self))
       return self.parent_net.get_layer(layer_name[len("base:"):])
+    if layer_name == "data" or layer_name.startswith("data:"):
+      # Not created yet. Try to create it now.
+      return self.construct_layer(name=layer_name, net_dict={}, check_existing=False)
     if '/' in layer_name:
       # this is probably a path to a sub-layer
       root_layer = self.get_layer(layer_name.split('/')[0])  # get the root-layer (first part of the path)
@@ -730,13 +745,28 @@ class TFNetwork(object):
       raise LayerNotFound("layer %r not found in %r" % (layer_name, self))
     return self.layers[layer_name]
 
+  def _get_all_layers(self):
+    """
+    :return: all layers, including extra net
+    :rtype: list[LayerBase]
+    """
+    layers = []
+    for (_, layer) in sorted(self.layers.items()):
+      if layer not in layers:
+        layers.append(layer)
+    if self.extra_net:
+      for layer in self.extra_net._get_all_layers():
+        if layer not in layers:
+          layers.append(layer)
+    return layers
+
   def get_params_list(self):
     """
     :return: list of model variables, i.e. from all the layers, excluding auxiliary vars like global_step
     :rtype: list[tf.Variable]
     """
     l = []  # type: list[tf.Variable]
-    for layer_name, layer in sorted(self.layers.items()):
+    for layer in self._get_all_layers():
       assert isinstance(layer, LayerBase)
       for param_name, param in sorted(layer.params.items()):
         assert isinstance(param, tf.Variable)
@@ -751,7 +781,7 @@ class TFNetwork(object):
     :rtype: dict[str,tf.Variable|tensorflow.python.training.saver.BaseSaverBuilder.SaveableObject]
     """
     d = {}
-    for layer_name, layer in sorted(self.layers.items()):
+    for layer in self._get_all_layers():
       assert isinstance(layer, LayerBase)
       d.update(layer.get_saveable_params_dict())
     return d
@@ -762,7 +792,7 @@ class TFNetwork(object):
     :rtype: list[tf.Variable|tensorflow.python.training.saver.BaseSaverBuilder.SaveableObject]
     """
     l = []  # type: list[tf.Variable]
-    for layer_name, layer in sorted(self.layers.items()):
+    for layer in self._get_all_layers():
       assert isinstance(layer, LayerBase)
       for param_name, param in sorted(layer.get_saveable_params_dict().items()):
         if param in l:  # could happen with reuse_params
@@ -772,23 +802,12 @@ class TFNetwork(object):
     l += self.extra_vars_to_save
     return l
 
-  def get_params_nested_dict(self):
-    """
-    :return: dict: layer_name -> param_name -> variable
-    :rtype: dict[str,dict[str,tf.Variable]]
-    """
-    l = {}  # type: dict[str,dict[str,tf.Variable]]
-    for layer_name, layer in self.layers.items():
-      assert isinstance(layer, LayerBase)
-      l[layer_name] = layer.params
-    return l
-
   def get_trainable_params(self):
     """
     :return: list of variables
     :rtype: list[tf.Variable]
     """
-    if not self._selected_train_layers:
+    if self._selected_train_layers is None:
       self.declare_train_params()
     trainable_vars_col = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
     assert isinstance(trainable_vars_col, list)
@@ -796,13 +815,15 @@ class TFNetwork(object):
     for layer_name in sorted(self._selected_train_layers):
       layer = self.layers[layer_name]
       assert isinstance(layer, LayerBase)
-      if not layer.trainable:
-        continue
       for param_name, param in sorted(layer.params.items()):
         assert isinstance(param, tf.Variable)
         if param in trainable_vars_col:
           l.append(param)
           trainable_vars_col.remove(param)
+    if self.extra_net:
+      for param in self.extra_net.get_trainable_params():
+        if param not in l:
+          l.append(param)
     return l
 
   def declare_train_params(self, hidden_layer_selection=None, with_output=None):
@@ -816,6 +837,8 @@ class TFNetwork(object):
       hidden_layer_selection += [name for (name, layer) in self.layers.items() if layer.is_output_layer()]
     hidden_layer_selection = set(hidden_layer_selection)
     self._selected_train_layers = sorted(hidden_layer_selection)
+    if self.extra_net:
+      self.extra_net.declare_train_params()  # select all, currently...
 
   def get_num_params(self):
     """
@@ -1152,6 +1175,8 @@ class TFNetwork(object):
     :return: whether we are inside a :class:`RecLayer`. see :func:`get_rec_parent_layer`
     :rtype: bool
     """
+    if self._is_inside_rec_layer is not None:
+      return self._is_inside_rec_layer
     return self.get_rec_parent_layer() is not None
 
   def get_rec_parent_layer(self):
@@ -1175,6 +1200,9 @@ class TFNetwork(object):
     :rtype: TFNetworkRecLayer.RecStepInfoLayer|None
     """
     from TFNetworkRecLayer import RecStepInfoLayer, _SubnetworkRecCell
+    # Fast path first. This also enables some simple debugging.
+    if ":i" in self.layers and isinstance(self.layers[":i"], RecStepInfoLayer):
+      return self.layers[":i"]
     rec_layer = self.get_rec_parent_layer()
     # the second condition is true if all layers have been optimized out of the rec layer
     if not rec_layer or len(rec_layer.cell.layers_in_loop) == 0:

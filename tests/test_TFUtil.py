@@ -180,7 +180,7 @@ def test_Data_unknown_feature_no_time():
 
 
 def test_Data_time_end():
-  data = Data(name='att_weights_output', shape=(1, None), dim=None, time_dim_axis=2)
+  data = Data(name='att_weights_output', shape=(1, None), time_dim_axis=2)
   print("data:", data, "feature axis:", data.feature_dim_axis)
   assert data.shape == (1, None) and data.batch_dim_axis == 0 and data.time_dim_axis == 2
   # No test for feature axis, as it does not really matter.
@@ -412,6 +412,35 @@ def test_Data_copy_compatible_to_src_no_batch():
   assert d3.batch_shape == (None, 1, 1)
 
 
+def test_Data_copy_compatible_to_add_batch_dim():
+  common_data = Data(name='accum_att_weights_output', shape=(None, 1))
+  d1 = Data(name='att_weights_avg_output', shape=(1,), batch_dim_axis=None)
+  d2 = d1.copy_compatible_to(common_data)
+  assert d2.batch_dim_axis is not None and d2.batch_shape == (None, 1, 1)
+
+
+def test_Data_copy_compatible_to_time_axis_at_end():
+  data = Data(name='att_weights_output', shape=(1, None), time_dim_axis=2, feature_dim_axis=1)
+  common_data = Data(name='accum_att_weights_output', shape=(None, 1))
+  data2 = data.copy_compatible_to(common_data)
+  assert data2.batch_dim_axis == common_data.batch_dim_axis == 0
+  assert data2.time_dim_axis == common_data.time_dim_axis == 1
+  assert data2.feature_dim_axis == common_data.feature_dim_axis == 2
+  assert data2.shape == common_data.shape == (None, 1)
+  assert data2.dim == common_data.dim == 1
+
+
+def test_Data_copy_compatible_to_batch_axis1_time_axis_at_end():
+  data = Data(name='att_weights_output', shape=(1, None), time_dim_axis=2, feature_dim_axis=1, beam_size=12)
+  common_data = Data(name='accum_att_weights_output', shape=(None, 1), batch_dim_axis=1)
+  data2 = data.copy_compatible_to(common_data)
+  assert data2.time_dim_axis == common_data.time_dim_axis == 0
+  assert data2.batch_dim_axis == common_data.batch_dim_axis == 1
+  assert data2.feature_dim_axis == common_data.feature_dim_axis == 2
+  assert data2.shape == common_data.shape == (None, 1)
+  assert data2.dim == common_data.dim == 1
+
+
 def test_Data_feature_dim_axis_btd():
   d1 = Data(name="d1", shape=(None, 11), feature_dim_axis=-1)
   d2 = Data(name="d2", shape=(None, 11), feature_dim_axis=2)
@@ -557,6 +586,25 @@ def test_Data_copy_add_spatial_dim_no_batch_explicit_feature():
   d2 = d1.copy_add_spatial_dim(0)
   assert d2.batch_dim_axis is None and d2.time_dim_axis == 0 and d2.feature_dim_axis == 1
   assert d2.batch_shape == (1, 3) and d2.dim == 3
+
+
+def test_Data_copy_add_spatial_dim_becomes_new_feature():
+  d1 = Data(name='att_weights_avg_output', shape=(None,), batch_dim_axis=None, time_dim_axis=None)
+  d2 = d1.copy_add_spatial_dim(0)
+
+
+def test_Data_copy_add_spatial_dim_most_right():
+  d1 = Data(name='att_weights_avg_output', shape=(1,))
+  print(d1, "spatial axes:", d1.get_spatial_batch_axes())
+  d2 = d1.copy_add_spatial_dim(1)
+  print(d2, "spatial axes:", d2.get_spatial_batch_axes())
+  assert_equal(d2.get_spatial_batch_axes(), [1])
+
+
+def test_Data_copy_move_axis_time_to_end():
+  d1 = Data(name="att_weights", shape=(None, None, 4))
+  d2 = d1.copy_move_axis(d1.time_dim_axis, -1)
+  assert d2.shape == (None, 4, None) and d2.feature_dim_axis == 2 and d2.time_dim_axis == 3
 
 
 def test_get_initializer_zero():
@@ -1749,6 +1797,13 @@ def test_check_base_op_type_and_replace_sigmoid():
     assert_almost_equal(vy1, vy2)
 
 
+def test_move_axis_auto_optimize_multiple():
+  x0 = tf.constant(numpy.random.normal(size=(3, 4, 2, 5)).astype("float32"))
+  x1 = move_axis(x0, 2, 0)
+  x2 = move_axis(x1, 1, 3)
+  pass  # TODO check that there is only a single transpose....
+
+
 def test_string_merge():
   strings = [
     ["sub@@", "word", "test"],
@@ -1770,6 +1825,22 @@ def test_string_merge():
   res = [s.decode("utf8") for s in res]
   print(res)
   assert_equal(res, ["sub@@ word test", "hel@@ lo wo@@ r@@ ld", "foo"])
+
+
+def test_vocab_string_merge():
+  vocab = tf.convert_to_tensor(["</s>", "sub@@", "word", "test", "hel@@", "lo", "wo@@", "r@@", "ld", "foo", "bar"])
+  labels = tf.convert_to_tensor([[1, 2, 3, 0, 0, 0], [4, 5, 6, 7, 8, 0], [9, 0, 0, 0, 0, 0]])
+  seq_lens = tf.convert_to_tensor([4, 6, 2])
+  strings = vocab_idx_to_vocab_string(labels, vocab=vocab)
+  tf_res = string_merge(strings, seq_lens=seq_lens)
+  res = session.run(tf_res)
+  print(res)
+  assert isinstance(res, numpy.ndarray)
+  res = res.tolist()
+  print(res)
+  res = [s.decode("utf8") for s in res]
+  print(res)
+  assert_equal(res, ["sub@@ word test </s>", "hel@@ lo wo@@ r@@ ld </s>", "foo </s>"])
 
 
 def test_string_replace():
@@ -2035,11 +2106,11 @@ def test_get_var_update_ops__get_variable_value_copy_before_update_ops():
       # This should be the value after the update, and the grad is -2, lr 1, thus should be 2.
       v_read_val = tf.identity(v.read_value())
       res = [
-        tf.Print(0, ["loss:", loss]), tf.Assert(tf.equal(loss, 1.0), ["loss ", loss, " == 1"]),
-        tf.Print(0, ["v:", v]),
-        tf.Print(0, ["v.value:", v_val]),
+        py_print(0, ["loss:", loss]), tf.Assert(tf.equal(loss, 1.0), ["loss ", loss, " == 1"]),
+        py_print(0, ["v:", v]),
+        py_print(0, ["v.value:", v_val]),
         tf.Assert(tf.equal(v_val, 0.0), ["v.value ", v_val, " == 0"]),  # last snapshot
-        tf.Print(0, ["v.read_value:", v_read_val]),
+        py_print(0, ["v.read_value:", v_read_val]),
         tf.Assert(tf.equal(v_read_val, 2.0), ["v.read_value ", v_read_val, " == 2"])  # after update
       ]
     session.run(v.initializer)

@@ -1,6 +1,6 @@
 
 # start: nosetests $this_file --nologcapture
-
+from __future__ import division
 import logging
 logging.getLogger('tensorflow').disabled = True
 import tensorflow as tf
@@ -116,6 +116,36 @@ def test_concat_sources_missing_dim():
     session.run(out.output.placeholder)
 
 
+def test_LinearLayer_batch_feature_major():
+  with make_scope() as session:
+    network = TFNetwork(config=Config(), extern_data=ExternData(), train_flag=True)
+    n_in = 3
+    n_out = 7
+    source = InternalLayer(
+      name="source", network=network, output=Data(
+        name="source", shape=(n_in, None), time_dim_axis=2, auto_create_placeholders=True))
+    assert source.output.feature_dim_axis == 1
+    assert source.output.is_batch_feature_major
+    out_template = LinearLayer.get_out_data_from_opts(
+      name="lin", network=network, n_out=n_out, activation=None, sources=[source])
+    out_template.sanity_check()
+    assert out_template.shape == (n_out, None) and (out_template.feature_dim_axis, out_template.time_dim_axis) == (1, 2)
+    assert out_template.is_batch_feature_major
+    with tf.variable_scope("lin"):
+      layer = LinearLayer(
+        name="lin", network=network, n_out=n_out, activation=None, sources=[source], output=out_template)
+    layer.output.sanity_check()
+    n_batch = 5
+    n_times = [13, 13, 11, 7, 5]
+    assert len(n_times) == n_batch
+    n_time = max(n_times)
+    feed_dict = {
+      source.output.placeholder: numpy.random.normal(size=(n_batch, n_in, n_time)).astype("float32"),
+      source.output.size_placeholder[1]: numpy.array(n_times, dtype="int32")}
+    session.run(tf.global_variables_initializer())
+    session.run(layer.output.placeholder, feed_dict=feed_dict)
+
+
 def test_batch_norm_vars():
   with make_scope() as session:
     n_in, n_out = 2, 3
@@ -144,6 +174,131 @@ def test_batch_norm_vars():
     assert_equal(layer.params[bn_prefix + "gamma"].get_shape().as_list(), [1, 1, n_out])
     assert_equal(layer.params[bn_prefix + "mean"].get_shape().as_list(), [1, 1, n_out])
     assert_equal(layer.params[bn_prefix + "variance"].get_shape().as_list(), [1, 1, n_out])
+
+
+def test_batch_norm():
+  with make_scope() as session:
+    import numpy as np
+    net = TFNetwork(extern_data=ExternData())
+    net.train_flag = True
+    with tf.variable_scope("src_nchw"):
+      src_nhwc = InternalLayer(name="src_nchw", network=net, out_type={"dim": 16,
+                                                                       "shape": (None, 16, 16),
+                                                                       "batch_dim_axis": 0,
+                                                                       "time_dim_axis": 1,
+                                                                       "feature_dim_axis": 3,
+                                                                       "sparse": False
+                                                                       })
+      src_nhwc.output.placeholder = tf.placeholder(shape=(None, None, 16, 16), dtype=tf.float32)
+      src_nhwc.output.size_placeholder = {0: tf.placeholder(shape=(None,), dtype=tf.int32)}
+
+    rnd = np.random.RandomState(42)
+    mean =  tf.constant(rnd.rand(1, 1, 1, 16), name="rand_mean", dtype=tf.float32)
+    variance = tf.constant(rnd.rand(1, 1, 1, 16), name="rand_var", dtype=tf.float32)
+    input_data = rnd.rand(10, 11, 16, 16)
+    seq_lens = np.array([11, 11, 11, 11, 11, 11, 11, 11, 11, 11])
+
+    with tf.variable_scope("batch_norm_masked_nchw"):
+      batch_norm_1 = BatchNormLayer(name="batch_norm_masked_nchw", network=net, masked_time=True,
+                                    sample_mean=mean, sample_variance=variance,
+                                    sources=[src_nhwc],
+                                    output=BatchNormLayer.get_out_data_from_opts(name="batch_norm_masked_nchw",
+                                                                                 sources=[src_nhwc],
+                                                                                 network=net))
+      batch_norm_1.post_init(layer_desc=None)
+    with tf.variable_scope("batch_norm_nonmasked_nchw"):
+      batch_norm_2 = BatchNormLayer(name="batch_norm_nonmasked_nchw", network=net, masked_time=False,
+                                    sample_mean=mean, sample_variance=variance,
+                                    sources=[src_nhwc],
+                                    output=BatchNormLayer.get_out_data_from_opts(name="batch_norm_nonmasked_nchw",
+                                                                                 sources=[src_nhwc],
+                                                                                 network=net))
+      batch_norm_2.post_init(layer_desc=None)
+    tf.global_variables_initializer().run()
+    out_1, seq_lens_1 = session.run([batch_norm_1.output.placeholder,
+                                 batch_norm_1.output.size_placeholder[0]],
+                                feed_dict={src_nhwc.output.placeholder: input_data,
+                                           src_nhwc.output.size_placeholder[0]: seq_lens}
+                                )
+    out_2, seq_lens_2 = session.run([batch_norm_2.output.placeholder,
+                                 batch_norm_2.output.size_placeholder[0]],
+                                feed_dict={src_nhwc.output.placeholder: input_data,
+                                           src_nhwc.output.size_placeholder[0]: seq_lens}
+                                )
+    assert np.array_equal(out_1, out_2)
+    print(np.sum(out_1 - out_2))
+
+
+def test_batch_norm_unequal_seq_len():
+  with make_scope() as session:
+    import numpy as np
+    import numpy.testing as npt
+    net = TFNetwork(extern_data=ExternData())
+    net.train_flag = True
+    with tf.variable_scope("src_nhwc"):
+      src_nhwc = InternalLayer(name="src_nhwc", network=net, out_type={"dim": 16,
+                                                                       "shape": (None, 16, 16),
+                                                                       "batch_dim_axis": 0,
+                                                                       "time_dim_axis": 1,
+                                                                       "feature_dim_axis": 3,
+                                                                       "sparse": False
+                                                                       })
+      src_nhwc.output.placeholder = tf.placeholder(shape=(None, None, 16, 16), dtype=tf.float32)
+      src_nhwc.output.size_placeholder = {0: tf.placeholder(shape=(None,), dtype=tf.int32)}
+
+    rnd = np.random.RandomState(42)
+    mean = tf.constant(rnd.rand(1, 1, 1, 16), name="rand_mean", dtype=tf.float32)
+    variance = tf.constant(rnd.rand(1, 1, 1, 16), name="rand_var", dtype=tf.float32)
+    input_data = rnd.rand(10, 11, 16, 16).astype('f')
+    input_data[2, 5:, :, :] = 0
+    data_mean = np.mean(input_data, axis=(0, 1, 2), keepdims=True, dtype=np.float32)
+    data_var = np.var(input_data, axis=(0, 1, 2), keepdims=True, dtype=np.float32)
+    input_data_masked = np.copy(input_data)
+    seq_lens = np.array([11, 11, 5, 11, 11, 11, 11, 11, 11, 11], dtype=np.float32)
+    n1 = 9 * 11 * 16 + 5 * 16
+    n2 = 10 * 11 * 16
+
+    with tf.variable_scope("batch_norm_masked_nchw"):
+      batch_norm_1 = BatchNormLayer(name="batch_norm_masked_nchw", network=net, masked_time=True,
+                                    sample_mean=mean, sample_variance=variance,
+                                    use_shift=False, use_std=False, epsilon=0.0,
+                                    sources=[src_nhwc],
+                                    output=BatchNormLayer.get_out_data_from_opts(name="batch_norm_masked_nchw",
+                                                                                 sources=[src_nhwc],
+                                                                                 network=net))
+      batch_norm_1.post_init(layer_desc=None)
+    with tf.variable_scope("batch_norm_nonmasked_nchw"):
+      batch_norm_2 = BatchNormLayer(name="batch_norm_nonmasked_nchw", network=net, masked_time=False,
+                                    sample_mean=mean, sample_variance=variance,
+                                    use_shift=False, use_std=False, epsilon=0,
+                                    sources=[src_nhwc],
+                                    output=BatchNormLayer.get_out_data_from_opts(name="batch_norm_nonmasked_nchw",
+                                                                                 sources=[src_nhwc],
+                                                                                 network=net))
+      batch_norm_2.post_init(layer_desc=None)
+    tf.global_variables_initializer().run()
+    out_1, seq_lens_1 = session.run([batch_norm_1.output.placeholder,
+                                     batch_norm_1.output.size_placeholder[0]],
+                                    feed_dict={src_nhwc.output.placeholder: input_data,
+                                               src_nhwc.output.size_placeholder[0]: seq_lens}
+                                    )
+    out_2, seq_lens_2 = session.run([batch_norm_2.output.placeholder,
+                                 batch_norm_2.output.size_placeholder[0]],
+                                feed_dict={src_nhwc.output.placeholder: input_data_masked,
+                                           src_nhwc.output.size_placeholder[0]: seq_lens}
+                                )
+    # Manually calculating batch_norm and compare to the tf output
+    np_bn2 = (input_data - data_mean) * (1.0 / np.sqrt(data_var))
+    npt.assert_array_almost_equal(np_bn2, out_2, decimal=5)
+    # Manually calculating batch_norm with different seq_lens, having:
+    # Mean_1 = n2 / n1 * Mean_2
+    # Var_1 = n2 / n1 * (Var_2 + Mean_2 ^ 2 (1 - n2 / n1))
+    # bn_1 = (x - Mean_1) * 1 / sqrt(Var_1)
+    # Substituting Mean_1 and Var_1:
+    np_bn1 = (input_data - n2 / n1 * data_mean) * \
+             (1.0 / np.sqrt(n2 / n1 * (data_var + data_mean ** 2 * (1 - n2 / n1))))
+    # Check with tf output.
+    npt.assert_array_almost_equal(np_bn1, out_1, decimal=5)
 
 
 def test_activation_layer_net_construct():
@@ -207,6 +362,37 @@ def test_combine_layer_net_construct():
     config.update(dict(num_inputs=4, num_outputs=9))
     network = TFNetwork(config=config, train_flag=True)
     network.construct_from_dict(net_dict)
+
+
+def test_CombineLayer_different_batch_axis():
+  # ["base:enc_ctx", "weight_feedback", "s_transformed"]
+  # base:enc_ctx: Data(name='enc_ctx_output', shape=(None, 14), batch_dim_axis=1)
+  # weight_feedback: Data(name='weight_feedback_output', shape=(None, 14), batch_dim_axis=1)
+  # s_transformed: Data(name='s_transformed_output', shape=(14,), time_dim_axis=None)
+  # out: Data(name='energy_in_output', shape=(None, 14), beam_size=3)
+  with make_scope() as session:
+    config = Config({"debug_print_layer_output_template": True})
+    net = TFNetwork(config=config, extern_data=ExternData(), train_flag=True)
+    n_dim = 7
+    l1 = net.add_layer(
+      name="enc_ctx", layer_class=InternalLayer,
+      output=Data(name='enc_ctx_output', shape=(None, n_dim), auto_create_placeholders=True))
+    l2 = net.add_layer(
+      name="weight_feedback", layer_class=InternalLayer,
+      output=Data(name='weight_feedback_output', shape=(None, n_dim), batch_dim_axis=1, auto_create_placeholders=True))
+    l3 = net.add_layer(
+      name="s_transformed", layer_class=InternalLayer,
+      output=Data(name='s_transformed_output', shape=(n_dim,), time_dim_axis=None, auto_create_placeholders=True))
+    out = net.add_layer(name="energy_in", layer_class=CombineLayer, kind="add", sources=[l1, l2, l3])
+    print("out:", out)
+    n_batch = 3
+    n_time = 5
+    session.run(out.output.placeholder, {
+      l1.output.placeholder: numpy.random.normal(size=(n_batch, n_time, n_dim)).astype("float32"),
+      l1.output.size_placeholder[0]: numpy.array([n_time] * 3),
+      l2.output.placeholder: numpy.random.normal(size=(n_time, n_batch, n_dim)).astype("float32"),
+      l2.output.size_placeholder[0]: numpy.array([n_time] * 3),
+      l3.output.placeholder: numpy.random.normal(size=(n_batch, n_dim))})
 
 
 def test_CombineLayer_two_time_dims():
@@ -645,6 +831,25 @@ def test_ConvLayer_get_valid_out_dim():
   assert_equal(ConvLayer.calc_out_dim(in_dim=41, stride=1, filter_size=2, padding="valid"), 40)
   assert_equal(ConvLayer.calc_out_dim(in_dim=40, stride=2, filter_size=2, padding="valid"), 20)
   assert_equal(ConvLayer.calc_out_dim(in_dim=2, stride=1, filter_size=3, padding="valid"), 0)
+
+
+def test_untrainable_params():
+  with make_scope() as session:
+    config = Config()
+    n_in, n_out = 2, 3
+    config.update({
+      "num_outputs": n_out,
+      "num_inputs": n_in,
+      "network": {
+        "l1": {"class": "linear", "activation": None, "n_out": n_out},
+        "output": {"class": "linear", "activation": None, "from": ["l1"], "n_out": n_out, "trainable": False}
+      }
+    })
+    network = TFNetwork(config=config, train_flag=True)
+    network.construct_from_dict(config.typed_dict["network"])
+    l1 = network.layers["l1"]
+    l2 = network.layers["output"]
+    assert_equal(set(network.get_trainable_params()), {l1.params["W"], l1.params["b"]})
 
 
 def test_reuse_params():
@@ -1183,7 +1388,6 @@ def test_ReduceLayer_NCHW():
                                         src_nchw.output.size_placeholder[1]: np.full(shape=(10,), fill_value=11)})
     assert_equal(out1.shape, (10, 11, 16))
     assert_equal(out2.shape, (16, 11, 16))
-    assert reduce1.output.feature_dim_axis is None and reduce1.output.dim is None
     assert reduce1.output.time_dim_axis == 1
     assert reduce2.output.feature_dim_axis == 0 and reduce2.output.dim == 16
     assert reduce2.output.batch_dim_axis is None
@@ -1456,6 +1660,38 @@ def test_LossAsIs_custom_dim():
     network.construct_from_dict(net_dict)
     loss = session.run(network.get_total_loss())
     assert loss
+
+
+def test_param_variational_noise():
+  from TFUtil import print_graph_output, find_ops_with_tensor_input
+  config = Config({
+    "debug_print_layer_output_template": True,
+    "param_variational_noise": 0.075,
+    "extern_data": {"data": {"dim": 7}}
+  })
+  with make_scope() as session:
+    network = TFNetwork(config=config, train_flag=True)
+    # Do subnetwork by intention, to test when we have multiple variable scopes.
+    network.construct_from_dict({
+      "output": {
+        "class": "subnetwork",
+        "subnetwork": {
+          "output": {"class": "linear", "n_out": 13, "activation": "tanh"}
+        }
+      }
+    })
+    out = network.get_default_output_layer().output.placeholder
+    print("output:")
+    print_graph_output(out)
+    params = network.get_params_list()
+    print("params:", params)
+    assert len(params) == 2  # weights and bias
+    for param in params:
+      print("param:", param)
+      ops = find_ops_with_tensor_input(param, fetches=out)
+      print("param graph:")
+      print_graph_output(ops)
+      assert len(ops) == 1 and "param_variational_noise" in ops[0].name
 
 
 def _create_data(n_batch, n_time, n_feature, network, dtype=tf.int32, offset=0, sparse=True):

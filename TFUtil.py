@@ -237,6 +237,7 @@ class Data(object):
                available_for_inference=True,
                auto_create_placeholders=False,
                vocab=None,
+               same_dim_tags_as=None,
                beam_size=None):
     """
     :param str name:
@@ -257,6 +258,7 @@ class Data(object):
       The size is always a tensor of shape (batch,), i.e. the size can be different for each sequence in a batch.
     :param bool available_for_inference: e.g. the extern data "classes" is usually not available for inference
     :param str|dict[str]|GeneratingDataset.Vocabulary|None vocab:
+    :param dict[int|str,DimensionTag]|None same_dim_tags_as: will mark our dimension tags to be the same
     :param int|None beam_size: the batch-dim could be extended by a beam-size,
       such that it represents the merged dims [batch, beam_size].
     """
@@ -363,6 +365,11 @@ class Data(object):
       assert self.sparse, "%s should represent indices of %s" % (self, vocab)
       assert self.dim == vocab.num_labels, "%s dims do not match with vocab %s" % (self, vocab)
     self.vocab = vocab
+    if same_dim_tags_as:
+      # Note that this currently does not work as intended at template construction time...
+      for _axis, _dim_tag in sorted(same_dim_tags_as.items()):
+        _axis = self.get_axis_from_description(_axis)
+        self.get_dim_tag(_axis).declare_same_as(_dim_tag)
     self.sanity_check()
 
   def sanity_check(self, ignore_placeholder=False):
@@ -380,7 +387,8 @@ class Data(object):
     if self.sparse:
       assert self.feature_dim_axis is None, "%s: If sparse, there cannot be a feature dim axis." % self
     if self.feature_dim_axis is not None:
-      assert self.dim == self.batch_shape[self.feature_dim_axis], "%s: inconsistent dim" % self
+      assert self.dim == self.batch_shape[self.feature_dim_axis], (
+        "%s: inconsistent dim. feature axis or unspecified: %r." % (self, self.feature_dim_axis_or_unspecified))
     if not ignore_placeholder and self.placeholder is not None:
       self.placeholder.set_shape(self.batch_shape)
 
@@ -408,6 +416,8 @@ class Data(object):
       keys += ["available_for_inference"]
     if self.beam_size is not None:
       keys += ["beam_size"]
+    if self.vocab:
+      keys += ["vocab"]
     return {key: getattr(self, key) for key in keys}
 
   def get_description(self, with_name=True, with_placeholder=False):
@@ -587,6 +597,25 @@ class Data(object):
     data = data.copy_with_feature_dim_axis(1)
     return data
 
+  def copy_as_batch_spatial_major(self):
+    """
+    :return: copy with batch_dim_axis == 0, then all dynamic axes, then any other spatial axes, last feature axis
+    :rtype: Data
+    """
+    data = self.copy_as_batch_major()
+    if data.feature_dim_axis is not None:
+      data = data.copy_with_feature_last()
+    if data.size_placeholder:
+      for i, (j, size) in enumerate(sorted(data.size_placeholder.items())):
+        data = data.copy_move_axis(data.get_batch_axis(j), i + 1)
+    if data.feature_dim_axis is not None:
+      assert data.feature_dim_axis == data.batch_ndim - 1
+      # Maybe reset feature_dim_axis to unspecified.
+      if data.feature_dim_axis_or_unspecified is not NotSpecified:
+        if data._default_feature_dim_axis() == data.feature_dim_axis:
+          data.feature_dim_axis = NotSpecified
+    return data
+
   def copy_with_feature_last(self):
     """
     :return: copy of self with feature_dim_axis being the very last axis
@@ -602,7 +631,7 @@ class Data(object):
     :rtype: Data
     """
     assert self.batch_dim_axis is None
-    if not self.sparse:
+    if self.feature_dim_axis is not None:
       assert batch_dim_axis <= self.feature_dim_axis, "does not work yet otherwise, feature-dim-axis must be last"
     data = self.copy()
     if data.placeholder is not None:
@@ -640,6 +669,9 @@ class Data(object):
       counted_with_batch_dim=True, only_available=True, include_batch_dim_axis=True)
     for k, a in other_special_axes.items():
       setattr(data, k, a if (a < spatial_dim_axis) else (a + 1))
+    if data.feature_dim_axis is not None:
+      # feature dim axis might have changed if unspecified, so just update dim
+      data.dim = data.batch_shape[data.feature_dim_axis]
     data.sanity_check()
     return data
 
@@ -717,7 +749,11 @@ class Data(object):
     assert self.dtype == data.dtype
     _, dim_tags = DimensionTag.get_all_dimension_tags([self, data], allow_same_feature_dim=True)
     v = self.copy()
+    if data.batch_dim_axis is not None and v.batch_dim_axis is None:
+      v = v.copy_add_batch_dim(0)  # later we might move the axis
     # Add feature dim, if needed.
+    if data.feature_dim_axis_or_unspecified is NotSpecified:
+      v.feature_dim_axis = NotSpecified
     if data.feature_dim_axis is not None and v.feature_dim_axis is None:
       v = v.copy_add_feature_dim()
     # Add spatial dims, in case we miss any.
@@ -727,17 +763,33 @@ class Data(object):
           continue  # This one seems to exist already, add the next one.
         axis_wo_batch = data.get_batch_axis_excluding_batch(axis)
         v = v.copy_add_spatial_dim(v.get_batch_axis(axis_wo_batch))
-    assert data.get_spatial_axes() == v.get_spatial_axes()
-    if v.batch_dim_axis != data.batch_dim_axis:
-      assert data.batch_dim_axis is not None
-      if v.batch_dim_axis is not None:
-        v = v.copy_with_batch_dim_axis(data.batch_dim_axis)
-      else:
-        # Note that it might be important here that we added any missing spatial dims before.
-        v = v.copy_add_batch_dim(data.batch_dim_axis)
-    assert v.batch_dim_axis == data.batch_dim_axis
-    assert v.feature_dim_axis == data.feature_dim_axis
+    # Now we assume that we have all missing axes added,
+    # but they might still be in a wrong order.
+    assert len(data.get_spatial_batch_axes()) == len(v.get_spatial_batch_axes())
     assert v.batch_ndim == data.batch_ndim
+    # Now maybe move batch/feature axis.
+    # We might do multiple iterations here, depending on which axis comes first.
+    # This is a bit ugly, but the code is simpler.
+    num_iterations = 0
+    while True:
+      num_iterations += 1
+      assert num_iterations <= 4
+      if v.batch_dim_axis != data.batch_dim_axis:
+        assert data.batch_dim_axis is not None and v.batch_dim_axis is not None
+        v = v.copy_with_batch_dim_axis(data.batch_dim_axis)
+        assert v.batch_dim_axis == data.batch_dim_axis
+        continue
+      if v.feature_dim_axis != data.feature_dim_axis:
+        assert data.feature_dim_axis is not None and v.feature_dim_axis is not None
+        v = v.copy_with_feature_dim_axis(data.feature_dim_axis)
+        assert v.feature_dim_axis == data.feature_dim_axis
+        if data.feature_dim_axis_or_unspecified is NotSpecified:
+          v.feature_dim_axis = NotSpecified
+          assert v.feature_dim_axis == data.feature_dim_axis
+        continue
+      # Now we have both equal.
+      break
+    assert data.get_spatial_batch_axes() == v.get_spatial_batch_axes()
     if unbroadcast and any([d1 != 1 and d2 == 1 for (d1, d2) in zip(data.batch_shape, v.batch_shape)]):
       v.size_placeholder.update(data.size_placeholder or {})
       if v.placeholder is not None:
@@ -836,12 +888,13 @@ class Data(object):
         data.time_dim_axis = None
       else:
         data.time_dim_axis = self.time_dim_axis - len([axis for axis in axes if axis < self.time_dim_axis])
-    if self.feature_dim_axis is not None and self.feature_dim_axis_or_unspecified is not NotSpecified:
-      if self.feature_dim_axis in axes:
-        data.feature_dim_axis = None
-      else:
-        data.feature_dim_axis = self.feature_dim_axis - len([axis for axis in axes if axis < self.feature_dim_axis])
-    if data.feature_dim_axis != self.feature_dim_axis:
+    if not self.sparse:
+      if self.feature_dim_axis is not None and self.feature_dim_axis_or_unspecified is not NotSpecified:
+        if self.feature_dim_axis in axes:
+          data.feature_dim_axis = None
+        else:
+          data.feature_dim_axis = self.feature_dim_axis - len([axis for axis in axes if axis < self.feature_dim_axis])
+      # Always reset dim. We might have a different feature axis now (if it was and is unspecified, i.e. automatic).
       if data.feature_dim_axis is not None:
         data.dim = data.batch_shape[data.feature_dim_axis]
       else:
@@ -1088,7 +1141,13 @@ class Data(object):
     if not self.shape:
       return None
     # Allow same as time-dim-axis...
-    return [i for i in range(self.batch_ndim) if i != self.batch_dim_axis][-1]
+    axes = [i for i in range(self.batch_ndim) if i != self.batch_dim_axis]
+    assert axes
+    static_axes = [i for i in axes if self.batch_shape[i] is not None]
+    # Prefer last static, if available.
+    if static_axes:
+      return static_axes[-1]
+    return axes[-1]
 
   @property
   def feature_dim_axis(self):
@@ -1198,10 +1257,11 @@ class Data(object):
       x.set_shape([None] * self.batch_ndim)
     return x
 
-  def get_axes(self, exclude_time=False, exclude_batch=False):
+  def get_axes(self, exclude_time=False, exclude_batch=False, exclude_feature=False):
     """
     :param bool exclude_time: will filter out the time-axis
     :param bool exclude_batch: will filter out the batch-axis
+    :param bool exclude_feature: will filter out the feature-axis
     :return: list of axes, like `range(len(self.shape))`, calculated with batch dim.
     :rtype: list[int]
     """
@@ -1210,19 +1270,30 @@ class Data(object):
       axes.pop(axes.index(self.time_dim_axis))
     if exclude_batch and self.batch_dim_axis is not None:
       axes.pop(axes.index(self.batch_dim_axis))
+    if exclude_feature and self.feature_dim_axis is not None:
+      axes.pop(axes.index(self.feature_dim_axis))
     return axes
 
-  def get_axes_from_description(self, axes):
+  def get_axes_from_description(self, axes, allow_int=True):
     """
     :param int|list[int]|str|list[str]|None axes: one axis or multiple axis, or none.
       This is counted with batch-dim, which by default is axis 0 (see enforce_batch_dim_axis).
       It also accepts the special tokens "B"|"batch", "spatial", "spatial_except_time", or "F"|"feature",
       and more (see the code).
+    :param bool allow_int: whether to allow an int directly. in almost all cases, it is better to use a symbolic name
+      to specify an axis, as different layers could reorder them, and maybe also change their behavior in the future.
     :return: list of axes, counted with batch-dim
     :rtype: list[int]
     """
     if axes is None or axes == "":
       return []
+    if not allow_int:
+      assert not isinstance(axes, int)
+    assert isinstance(axes, (str, int, list, tuple))
+    if isinstance(axes, (list, tuple)):
+      assert all([a is None or isinstance(a, (str, int)) for a in axes])
+      if not allow_int:
+        assert all([not isinstance(a, int) for a in axes])
     if isinstance(axes, str):
       import re
       axes = axes.lower()
@@ -1298,14 +1369,15 @@ class Data(object):
         res.append(i)
     return res
 
-  def get_axis_from_description(self, axis):
+  def get_axis_from_description(self, axis, allow_int=True):
     """
     :param int|str axis:
+    :param bool allow_int:
     :return: axis, counted with batch-dim
     :rtype: int
     """
-    axes = self.get_axes_from_description(axis)
-    assert len(axes) == 1, "%r is not a unique axis but %r" % (axis, axes)
+    axes = self.get_axes_from_description(axis, allow_int=allow_int)
+    assert len(axes) == 1, "%r: %r is not a unique axis but %r" % (self, axis, axes)
     return axes[0]
 
   def get_batch_axis_excluding_batch(self, axis):
@@ -1349,12 +1421,44 @@ class Data(object):
     :rtype: bool
     """
     assert self.time_dim_axis is not None
+    if self.placeholder is None and self.size_placeholder is None:
+      # Run at template construction time.
+      return self.batch_shape[self.time_dim_axis_excluding_batch] is None
     if self.time_dim_axis_excluding_batch in self.size_placeholder:
       return True
     assert isinstance(self.shape[self.time_dim_axis_excluding_batch], int), (
       "%s: dynamic time axis dim (None) (axis %i) but size_placeholder %r misses information" % (
         self, self.time_dim_axis, self.size_placeholder))
     return False
+
+  def is_axis_dynamic(self, axis):
+    """
+    :param int axis: counted with batch-dim axis
+    :return: dynamic, i.e. we have it in size_placeholder.
+      Note that this does not perfectly match with :func:`get_dynamic_axes`, but more with :func:`is_time_axis_dynamic`,
+      although probably in most (all?) cases it should match.
+      If True, you can get the size via :func:`get_dynamic_size`.
+    :rtype: bool
+    """
+    if axis == self.batch_dim_axis:
+      return False
+    if self.placeholder is None and self.size_placeholder is None:
+      # Run at template construction time.
+      return self.batch_shape[axis] is None
+    axis_wo_batch = self.get_batch_axis_excluding_batch(axis)
+    if axis_wo_batch in self.size_placeholder:
+      return True  # not quite the same as get_dynamic_axes
+    assert isinstance(self.batch_shape[axis], int)
+    return False
+
+  def get_dynamic_size(self, axis):
+    """
+    :param int axis: counted with batch-dim axis. :func:`is_axis_dynamic` should be True
+    :return: shape (B,)
+    :rtype: tf.Tensor
+    """
+    axis_wo_batch = self.get_batch_axis_excluding_batch(axis)
+    return self.size_placeholder[axis_wo_batch]
 
   def get_dynamic_axes(self):
     """
@@ -1388,7 +1492,7 @@ class Data(object):
 
   def get_sequence_lengths(self):
     """
-    :return: seq lens tensor of shape (batch,) of dtype int32
+    :return: seq lens tensor of shape (batch,) of dtype int32. also see :func:`get_dynamic_size`
     :rtype: tf.Tensor
     """
     assert self.time_dim_axis is not None
@@ -1414,15 +1518,29 @@ class Data(object):
       assert self.time_dim_axis == 1
       return sequence_mask(self.get_sequence_lengths())
 
-  def get_sequence_mask_broadcast(self):
+  def get_sequence_mask_broadcast(self, axis=None):
     """
+    :param int|None axis:
     :return: seq mask of shape ((batch,time) or (time,batch)) + (1,)s for remaining dims
+      if BT or TB major, and axis is T or None.
+      In general compatible to placeholder, i.e. same ndim, with broadcast dims.
+      We assert here that the axis is dynamic (:func:`is_axis_dynamic`), i.e. we have the size.
     :rtype: tf.Tensor
     """
-    seq_mask = self.get_sequence_mask()
-    assert seq_mask.get_shape().ndims == 2  # batch and time
-    seq_mask = expand_multiple_dims(
-      seq_mask, [i for i in range(self.batch_ndim) if i not in (self.batch_dim_axis, self.time_dim_axis)])
+    if axis is None:
+      assert self.time_dim_axis is not None
+      axis = self.time_dim_axis
+    assert axis != self.batch_dim_axis
+    size = self.get_dynamic_size(axis)
+    if axis >= self.batch_dim_axis:
+      seq_mask = sequence_mask(size)  # (B,T)
+    else:  # axis < batch_dim_axis
+      seq_mask = sequence_mask_time_major(size)  # (T,B)
+    shape = [1] * self.batch_ndim  # type: typing.List[typing.Union[int,tf.Tensor]]
+    placeholder_shape = tf.shape(self.placeholder)
+    shape[self.batch_dim_axis] = placeholder_shape[self.batch_dim_axis]
+    shape[axis] = placeholder_shape[axis]
+    seq_mask = tf.reshape(seq_mask, shape)
     assert seq_mask.get_shape().ndims == self.batch_ndim
     return seq_mask
 
@@ -3358,6 +3476,88 @@ def batched_uniq(x, seq_lens):
   return z, new_seq_lens
 
 
+def get_common_shape(values, ignore_axes=()):
+  """
+  Related: :func:`tf.broadcast_dynamic_shape`.
+  Also see :func:`unbroadcast_to_common_shape`.
+
+  :param list[tf.Tensor|float|int] values:
+  :param list[int]|tuple[int] ignore_axes: these axes will be ignored
+  :return: common shape of all values. broadcasts dims with 1. will use static dims when possible.
+    Dim of axes which are in `ignore_axes` will be None.
+  :rtype: list[tf.Tensor|int|None]
+  """
+  assert len(values) > 0
+  assert all([isinstance(value, (tf.Tensor, float, int)) for value in values])
+  # Filter out scalars.
+  values = [value for value in values if isinstance(value, tf.Tensor)]
+  assert all([value.shape.ndims is not None for value in values]), "some unknown ndim"
+  values = [value for value in values if value.shape.ndims > 0]
+  if not values:  # all were scalars?
+    return []
+  ndim = max([value.shape.ndims for value in values])
+  for value in values:
+    assert value.shape.ndims == ndim, "ndim does not match in values %r" % (values,)
+  for axis in ignore_axes:
+    assert 0 <= axis < ndim
+  with tf.name_scope("common_shape"):
+    common_shape = [None] * ndim  # type: typing.List[typing.Union[tf.Tensor,int,None]]
+    for axis in range(ndim):
+      if axis in ignore_axes:
+        continue  # does not matter
+      for value in values:
+        static_dim = value.shape.dims[axis].value  # type: typing.Optional[int]
+        if common_shape[axis] in (None, 1):
+          if static_dim is not None:
+            common_shape[axis] = static_dim
+          else:
+            common_shape[axis] = get_shape_dim(value, axis)
+        if static_dim not in (None, 1):
+          if isinstance(common_shape[axis], tf.Tensor):
+            common_shape[axis] = static_dim
+          else:  # common_shape is int
+            assert isinstance(common_shape[axis], int)
+            assert common_shape[axis] == static_dim, "non matching dim %r vs %r in axis %i, value %r of values %r" % (
+              common_shape[axis], static_dim, axis, value, values)
+    return common_shape
+
+
+def unbroadcast_to_common_shape(value, common_shape, ignore_axes=(), allow_only_noop=False):
+  """
+  :param tf.Tensor|T value:
+  :param list[tf.Tensor|int|None] common_shape: see :func:`get_common_shape`
+  :param list[int]|tuple[int] ignore_axes:
+  :param bool allow_only_noop: if False, and the unbroadcast is not a no-op, will raise an exception
+  :return: (maybe) unbroadcasted value
+  :rtype: tf.Tensor|T
+  """
+  if not isinstance(value, tf.Tensor):
+    if isinstance(value, (float, int)) and not common_shape:
+      return value
+    value = tf.convert_to_tensor(value)
+  ndim = value.shape.ndims
+  assert ndim is not None, "value has unknown ndim: %r" % value
+  if ndim == 0:
+    if not common_shape:
+      return value
+    value = expand_multiple_dims(value, axes=list(range(len(common_shape))))
+    ndim = len(common_shape)
+  static_shape = value.shape.as_list()
+  tile_multiples = [common_shape[_axis] if static_shape[_axis] == 1 else 1 for _axis in range(ndim)]
+  for axis in ignore_axes:
+    assert 0 <= axis < ndim
+    tile_multiples[axis] = 1
+  assert all([m is not None for m in tile_multiples]), (
+    "ignore_axes %r probably missing some axis for common shape %r" % (ignore_axes, common_shape))
+  if all([isinstance(m, int) and m == 1 for m in tile_multiples]):
+    # We have a no-op.
+    return value
+  assert not allow_only_noop, "need to broadcast value %r to common shape %r with tile multiples %r" % (
+    value, common_shape, tile_multiples)
+  value = tf.tile(value, tile_multiples, name="unbroadcast_to_common_shape")
+  return value
+
+
 def concat_with_opt_broadcast(values, allow_broadcast, axis, name="concat_with_opt_broadcast"):
   """
   :param list[tf.Tensor] values: all with same ndim
@@ -3378,31 +3578,11 @@ def concat_with_opt_broadcast(values, allow_broadcast, axis, name="concat_with_o
     axis += ndim
   assert 0 <= axis < ndim
   with tf.name_scope(name):
-    common_shape = [None] * ndim  # type: typing.List[typing.Union[tf.Tensor,int,None]]
-    for _axis in range(ndim):
-      if _axis == axis:
-        continue  # does not matter
-      for value in values:
-        static_dim = value.shape.dims[_axis].value
-        if common_shape[_axis] in (None, 1):
-          common_shape[_axis] = get_shape_dim(value, _axis)
-        if static_dim is not None:
-          if isinstance(common_shape[_axis], tf.Tensor):
-            common_shape[_axis] = static_dim
-          else:
-            assert common_shape[_axis] == static_dim, "non matching dim %r vs %r in axis %i, value %r of values %r" % (
-              common_shape[_axis], static_dim, _axis, value, values)
+    common_shape = get_common_shape(values, ignore_axes=[axis])
     # Now check all, or maybe unbroadcast.
     for i in range(len(values)):
-      value = values[i]
-      static_shape = value.shape.as_list()
-      tile_multiples = [common_shape[_axis] if static_shape[_axis] == 1 else 1 for _axis in range(ndim)]
-      tile_multiples[axis] = 1
-      if not all([isinstance(m, int) and m == 1 for m in tile_multiples]):
-        assert allow_broadcast[i], "need to broadcast value %r in values %r with tile multiples %r" % (
-          value, values, tile_multiples)
-        value = tf.tile(value, tile_multiples)
-        values[i] = value
+      values[i] = unbroadcast_to_common_shape(
+        values[i], common_shape=common_shape, ignore_axes=[axis], allow_only_noop=not allow_broadcast[i])
     # Now do the concat.
     return tf.concat(values, axis=axis, name=name)
 
@@ -4219,16 +4399,34 @@ def nan_to_num(x, nan_num=0, inf_num=1e30):
   with tf.name_scope("nan_to_num"):
     nan_num = tf.convert_to_tensor(nan_num, dtype=x.dtype)
     inf_num = tf.convert_to_tensor(inf_num, dtype=x.dtype)
-    # Note that tf.where() does not support broadcasting at the moment,
-    # so we need the same shape. The following will do that.
-    # This should be removed once tf.where() supports broadcasting.
-    # https://github.com/tensorflow/tensorflow/issues/3945
-    nan_num = tf.ones_like(x) * nan_num
-    inf_num = tf.ones_like(x) * inf_num
-    x = tf.where(tf.is_nan(x), nan_num, x)
-    x = tf.where(tf.logical_and(tf.is_inf(x), tf.greater(x, 0)), inf_num, x)
-    x = tf.where(tf.logical_and(tf.is_inf(x), tf.less(x, 0)), -inf_num, x)
+    x = where_bc(tf.is_nan(x), nan_num, x)
+    x = where_bc(tf.logical_and(tf.is_inf(x), tf.greater(x, 0)), inf_num, x)
+    x = where_bc(tf.logical_and(tf.is_inf(x), tf.less(x, 0)), -inf_num, x)
     return x
+
+
+def where_bc(condition, x, y, name="where_bc"):
+  """
+  This is basically :func:`tf.where` but with additional broadcasting support.
+  We explicitly require that the ndims match (or x, y can also be scalars).
+  See also :func:`get_common_shape` and :func:`unbroadcast_to_common_shape`.
+
+  https://github.com/tensorflow/tensorflow/issues/3945
+  https://github.com/tensorflow/tensorflow/issues/9284
+
+  :param tf.Tensor condition:
+  :param tf.Tensor|float|int x:
+  :param tf.Tensor|float|int y:
+  :param str name:
+  :return: basically tf.where(condition, x, y)
+  :rtype: tf.Tensor
+  """
+  with tf.name_scope(name):
+    common_shape = get_common_shape([condition, x, y])
+    condition = unbroadcast_to_common_shape(condition, common_shape=common_shape)
+    x = unbroadcast_to_common_shape(x, common_shape=common_shape)
+    y = unbroadcast_to_common_shape(y, common_shape=common_shape)
+    return tf.where(condition, x, y)
 
 
 def identity_op_nested(x, name="identity"):
@@ -4298,17 +4496,35 @@ def stop_event_writer_thread(event_writer):
 
 def optional_add(*args):
   """
-  :param list[tf.Tensor|None]|tf.Tensor args:
-  :rtype: tf.Tensor|None
+  :param list[tf.Tensor|None]|int|float|tf.Tensor args:
+  :rtype: tf.Tensor|int|float|None
   :return: sums all non-None values, or returns None if there are none
   """
   y = None
   for v in args:
     if v is not None:
-      if y is None:
+      if y is None or (isinstance(y, (int, float)) and y == 0):
         y = v
-      else:
+      elif not (isinstance(v, (int, float)) and v == 0):
         y = y + v
+  return y
+
+
+def optional_mul(*args):
+  """
+  :param list[tf.Tensor|None]|int|float|tf.Tensor args:
+  :rtype: tf.Tensor|int|float|None
+  :return: sums all non-None values, or returns None if there are none
+  """
+  y = None
+  for v in args:
+    if v is not None:
+      if isinstance(v, (int, float)) and v == 0:
+        return v
+      if y is None or (isinstance(y, (int, float)) and y == 1):
+        y = v
+      elif not (isinstance(v, (int, float)) and v == 1):
+        y = y * v
   return y
 
 
@@ -4464,10 +4680,11 @@ def global_tensor(f, name):
     return graph.get_tensor_by_name(abs_graph_name)
   except KeyError:  # does not exist yet
     pass
-  with tf.name_scope("global_tensor_%s" % name):  # relative to the current scope
-    v = f()
-  with tf.name_scope("globals/"):  # enter the absolute scope
-    v = tf.identity(v, name=name)
+  with tf.control_dependencies(None):  # reset any deps, e.g. being inside a while loop
+    with tf.name_scope("global_tensor_%s" % name):  # relative to the current scope
+      v = f()
+    with tf.name_scope("globals/"):  # enter the absolute scope
+      v = tf.identity(v, name=name)
   assert isinstance(v, tf.Tensor)
   assert v.name == abs_graph_name
   assert graph.get_tensor_by_name(abs_graph_name) is v
@@ -4549,13 +4766,27 @@ def encode_raw(x, axis=-1, seq_lens=None):
     return strings
 
 
+def get_shared_vocab(vocab_strings):
+  """
+  The vocab is shared across the current instance of the computation graph.
+  The tensor name might be different in different runs.
+
+  :param list[str] vocab_strings:
+  :return: shape (len(vocab_strings),), tf.string
+  :rtype: tf.Tensor
+  """
+  return global_tensor(
+    lambda: tf.convert_to_tensor(vocab_strings),
+    name="shared_vocab_%s" % hex(hash(tuple(vocab_strings))).replace("-", "_"))
+
+
 def map_labels(x, label_map, name="map_labels"):
   """
   :param tf.Tensor|tf.SparseTensor x: values of integer types
   :param dict[int,int|None] label_map: should be dense on input
   :param str name:
   :return: mapped values
-  :rtype: tf.Tensor
+  :rtype: tf.Tensor|tf.SparseTensor
   """
   if any([v is None for v in label_map.values()]):
     assert isinstance(x, tf.SparseTensor), "not supported otherwise currently"
@@ -6939,16 +7170,32 @@ def add_control_input(op, control_input):
   op._recompute_node_def()
 
 
-def bpe_idx_to_bpe_string(labels, vocab):
+def vocab_idx_to_vocab_string(labels, vocab):
   """
   Just does a lookup on vocab.
 
-  :param tf.Tensor labels: (batch,max_len), int32, indices in vocab
-  :param tf.Tensor vocab: (bpe_units,), string
-  :return: (batch,max_len), string
+  :param tf.Tensor labels: (batch,max_len), or any, int32, indices in vocab
+  :param tf.Tensor vocab: (vocab_size,), string
+  :return: (batch,max_len), or any, like labels, string
   :rtype: tf.Tensor
   """
   return tf.gather(params=vocab, indices=labels, axis=0)
+
+
+def vocab_idx_repr(labels, data):
+  """
+  :param tf.Tensor labels: int32, indices in vocab
+  :param Data data: might have vocab
+  :return: string or int32, shape as labels, or maybe without last axis
+  :rtype:
+  """
+  if data.vocab:
+    vocab = get_shared_vocab(data.vocab.labels)
+    return vocab_idx_to_vocab_string(labels, vocab)
+  if data.dim == 255:
+    if labels.shape.ndims >= 2:  # currently encode_raw also joins the strings in last axis
+      return encode_raw(labels)
+  return labels
 
 
 def string_merge(strings, seq_lens, separator=" "):
@@ -7061,6 +7308,71 @@ def string_words_calc_wer(hyps, refs):
   wer.set_shape(hyps.get_shape())
   wer = tf.cast(wer, tf.int64)  # no normalization, should be an integer
   return wer, get_sparse_tensor_length(refs_sparse)
+
+
+def py_print(pass_through_value, print_args, message=None, summarize=None, first_n=None, name="py_print"):
+  """
+  Like :func:`tf.Print`, but prints to Python stdout.
+  Also see :func:`tf.print`, which however also does not print to Python stdout.
+
+  :param tf.Tensor|int|float pass_through_value: will return tf.identity of this, but with side effect of printing
+  :param list[str|tf.Tensor] print_args:
+  :param str|None message: A string, prefix of the error message.
+  :param int summarize: Only print this many entries of each tensor. If None, then a
+    maximum of 3 elements are printed per input tensor.
+  :param int first_n: Only log `first_n` number of times. Negative numbers log always; this is the default.
+  :param str name:
+  :return: tf.identity(pass_through_value) with side effect of printing
+  :rtype: tf.Tensor
+  """
+  import numpy
+  if summarize is None:
+    summarize = 3
+  if first_n is None:
+    first_n = -1
+
+  class Counter:
+    count = 0
+
+  def _py_print(*_print_args):
+    Counter.count += 1
+    if first_n > 0 and first_n > Counter.count:
+      return False
+    next_item_add_new_line = False
+    s = ""
+    if message:
+      s += message
+    for arg in _print_args:
+      # Try to keep somewhat consistent with the tf.Print output.
+      if isinstance(arg, bytes):
+        arg_s = "[%s]" % arg.decode("utf8")
+      elif isinstance(arg, numpy.ndarray):
+        if arg.size == 0:
+          arg_s = "[]"
+        else:
+          arg_s = numpy.array2string(
+            arg, edgeitems=summarize, formatter={"int": str, "object": bytes.decode})
+      else:
+        arg_s = "[%r]" % arg
+      if "\n" in arg_s:
+        next_item_add_new_line = True
+        s += "\n"
+        s += arg_s
+      else:
+        if next_item_add_new_line:
+          next_item_add_new_line = False
+          s += "\n"
+        s += arg_s
+    try:
+      print(s)
+      return True
+    except BrokenPipeError:  # be silent about those. probably only at exit
+      return False
+
+  with tf.name_scope(name):
+    print_op = tf.py_func(_py_print, print_args, tf.bool, name=name)
+    with tf.control_dependencies([print_op]):
+      return tf.identity(pass_through_value)
 
 
 def get_positional_encoding(num_channels, length=None, position=None, min_timescale=1.0, max_timescale=1.0e4):

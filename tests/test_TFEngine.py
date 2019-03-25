@@ -1437,7 +1437,7 @@ def test_rec_subnet_eval_init_out_apply0():
                  "from": ["base:enc_ctx", "att_query"], "debug": True},  # (B, enc-T, H, 1)
 
       "att_weights": {"class": "softmax_over_spatial", "from": ["energy"], "energy_factor": EncKeyPerHeadDim ** -0.5},
-      "att_weights_avg": {"class": "reduce", "axes": -2, "mode": "avg", "from": ["att_weights"]},  # (B, enc-T, 1)
+      "att_weights_avg": {"class": "reduce", "axes": "static:0", "mode": "avg", "from": ["att_weights"]},  # (B, enc-T, 1)
       "accum_att_weights": {"class": "eval",
                             "from": ["prev:accum_att_weights", "att_weights_avg", "base:inv_fertility"],
                             "eval": "source(0) + source(1) * source(2) * 0.5",
@@ -1937,7 +1937,8 @@ def test_attention_forward_hdf_then_unflatten_2d():
   inner_att_output_layer = att_rec_layer.cell.net.layers["att_weights"]
   print("inner att weights layer:", inner_att_output_layer, inner_att_output_layer.output.size_placeholder)
 
-  assert att_output_layer.output.shape == (None, None, 1)  # dec-time, enc-time. the 1 is just an artifact of the construct
+  # dec-time, enc-time. the 1 is just an artifact of the construct
+  assert att_output_layer.output.copy_as_batch_spatial_major().shape == (None, None, 1)
   assert len(att_output_layer.output.size_placeholder) == 2  # encoder and decoder time
   hdf_fn = _get_tmp_file(suffix=".hdf")
   os.remove(hdf_fn)  # forward_to_hdf expects that the file does not exist

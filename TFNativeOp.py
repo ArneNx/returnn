@@ -1061,6 +1061,170 @@ def fast_baum_welch_staircase(am_scores, seq_lens, **opts):
     am_scores=am_scores, edges=edges, weights=weights, start_end_states=start_end_states, float_idx=float_idx)
 
 
+def edit_distance(a, a_len, b, b_len):
+  """
+  Wraps :class:`NativeOp.EditDistanceOp`.
+
+  :param tf.Tensor a: (batch,time1), int32
+  :param tf.Tensor a_len: (batch,), int32
+  :param tf.Tensor b: (batch,time2), int32
+  :param tf.Tensor b_len: (batch,), int32
+  :return: (batch,) tensor, int32, un-normalized edit distance
+  :rtype: tf.Tensor
+  """
+  maker = OpMaker(OpDescription.from_gen_base(NativeOp.EditDistanceOp))
+  op = maker.make_op()
+  return op(a, a_len, b, b_len)
+
+
+def optimal_completion_edit_distance(a, a_len, b, b_len):
+  """
+  Wraps :class:`NativeOp.OptimalCompletionEditDistanceOp`.
+
+  :param tf.Tensor a: (batch,time1), int32. prefix
+  :param tf.Tensor a_len: (batch,), int32
+  :param tf.Tensor b: (batch,time2), int32
+  :param tf.Tensor b_len: (batch,), int32
+  :return: (batch,) tensor, int32, un-normalized edit distance
+  :rtype: tf.Tensor
+  """
+  maker = OpMaker(OpDescription.from_gen_base(NativeOp.OptimalCompletionEditDistanceOp))
+  op = maker.make_op()
+  return op(a, a_len, b, b_len)
+
+
+def optimal_completion_edit_distance_per_successor(a, a_len, b, b_len, successors):
+  """
+  Wraps :class:`NativeOp.OptimalCompletionEditDistancePerSuccessorOp`.
+
+  :param tf.Tensor a: (batch,time1), int32. prefix
+  :param tf.Tensor a_len: (batch,), int32
+  :param tf.Tensor b: (batch,time2), int32
+  :param tf.Tensor b_len: (batch,), int32
+  :param tf.Tensor|int successors: (n_labels,), int32. scalar means tf.range(successors)
+  :return: (batch,n_labels) tensor, int32, un-normalized edit distance
+  :rtype: tf.Tensor
+  """
+  if isinstance(successors, int):
+    n_labels = successors
+    successors = tf.range(n_labels, name="successors_range")
+    successors.set_shape((n_labels,))
+  assert isinstance(successors, tf.Tensor)
+  successors.set_shape((None,))
+  maker = OpMaker(OpDescription.from_gen_base(NativeOp.OptimalCompletionEditDistancePerSuccessorOp))
+  op = maker.make_op()
+  return op(a, a_len, b, b_len, successors)
+
+
+def next_edit_distance_row(last_row, a, a_n, a_ended, b, b_len):
+  """
+  Wraps :class:`NativeOp.NextEditDistanceRowOp`.
+
+  :param tf.Tensor last_row: 2d (batch,b_time + 1), int32. last edit distances
+  :param tf.Tensor a: symbols. 1d (batch,), int32. current.
+  :param tf.Tensor a_n: scalar, int32. current position
+  :param tf.Tensor a_ended: 1d (batch,), int32 (casted from bool, because int32 easier to handle)
+  :param tf.Tensor b: symbols. 2d (batch,b_time), int32
+  :param tf.Tensor b_len: 1d (batch,), int32
+  :return: 2d (batch,b_time + 1), int32, next (unnormalized) edit distance row
+  :rtype: tf.Tensor
+  """
+  a_ended = tf.cast(a_ended, tf.int32)
+  maker = OpMaker(OpDescription.from_gen_base(NativeOp.NextEditDistanceRowOp))
+  op = maker.make_op()
+  return op(last_row, a, a_n, a_ended, b, b_len)
+
+
+def edit_distance_via_next_edit_distance_row(a, a_len, b, b_len, optimal_completion=False, full_row_output=False):
+  """
+  This is mostly for demonstration and debugging.
+  Should be equivalent to :func:`edit_distance` or :func:`optimal_completion_edit_distance`
+  (which should be much faster).
+
+  :param tf.Tensor a: (batch,time1), int32
+  :param tf.Tensor a_len: (batch,), int32
+  :param tf.Tensor b: (batch,time2), int32
+  :param tf.Tensor b_len: (batch,), int32
+  :param bool optimal_completion: calc optimal completion edit distance instead
+  :param bool full_row_output: outputs the full final row
+  :return: (batch,) or (batch,time2+1) tensor, int32, un-normalized edit distance
+  :rtype: tf.Tensor
+  """
+  from TFUtil import expand_dims_unbroadcast
+  with tf.name_scope("edit_distance_via_next_edit_distance_row"):
+    initial_row = expand_dims_unbroadcast(tf.range(tf.shape(b)[1] + 1), axis=0, dim=tf.shape(b)[0])  # (B,time2+1)
+
+    def cond(i, last_row):
+      return tf.less(i, tf.shape(a)[1])
+
+    def body(i, last_row):
+      a_ended = tf.greater_equal(i, a_len)  # (B,)
+      a_cur = a[:, i]  # (B,). would be more efficient via tf.TensorArray, but this is for demo only anyway
+      next_row = next_edit_distance_row(a=a_cur, a_n=i, a_ended=a_ended, b=b, b_len=b_len, last_row=last_row)
+      return i + 1, next_row
+
+    _, final_row = tf.while_loop(body=body, cond=cond, loop_vars=(0, initial_row), back_prop=False)
+
+    if full_row_output:
+      assert not optimal_completion  # assert the default, this would not have an effect
+      return final_row
+    elif not optimal_completion:
+      return final_row[:, -1]
+    else:
+      return tf.reduce_min(final_row, axis=1)
+
+
+def next_edit_distance_reduce(last_row, a, a_n, a_ended, b, b_len, optimal_completion=False):
+  """
+  Wraps :class:`NativeOp.NextEditDistanceReduceOp`.
+
+  :param tf.Tensor last_row: 2d (batch,b_time + 1), int32. last edit distances
+  :param tf.Tensor a: symbols. 2d (batch|1,n_labels), int32. current.
+  :param tf.Tensor a_n: scalar, int32. current position
+  :param tf.Tensor a_ended: 1d (batch,), int32 (casted from bool, because int32 easier to handle)
+  :param tf.Tensor b: symbols. 2d (batch,b_time), int32
+  :param tf.Tensor b_len: 1d (batch,), int32
+  :param bool|tf.Tensor optimal_completion:
+  :return: 2d (batch,n_labels), int32, next (unnormalized) (optimal completion) edit distance
+  :rtype: tf.Tensor
+  """
+  optimal_completion = tf.cast(tf.convert_to_tensor(optimal_completion), tf.int32)
+  a_ended = tf.cast(a_ended, tf.int32)
+  maker = OpMaker(OpDescription.from_gen_base(NativeOp.NextEditDistanceReduceOp))
+  op = maker.make_op()
+  return op(last_row, a, a_n, a_ended, b, b_len, optimal_completion)
+
+
+def optimal_completion_edit_distance_per_successor_via_next_edit_distance(a, a_len, b, b_len, successors):
+  """
+  Uses :func:`next_edit_distance_reduce` and :func:`edit_distance_via_next_edit_distance_row`.
+  Mostly for demonstration/testing.
+  In practice, you would do something similar, but in your own loop.
+  Similar to :func:`optimal_completion_edit_distance_per_successor`,
+  but the handling of ended sequences (from ``a``) is different.
+
+  :param tf.Tensor a: (batch,time1), int32. prefix
+  :param tf.Tensor a_len: (batch,), int32
+  :param tf.Tensor b: (batch,time2), int32
+  :param tf.Tensor b_len: (batch,), int32
+  :param tf.Tensor|int successors: (n_labels,), int32. scalar means tf.range(successors)
+  :return: (batch,n_labels) tensor, int32, un-normalized edit distance
+  :rtype: tf.Tensor
+  """
+  if isinstance(successors, int):
+    n_labels = successors
+    successors = tf.expand_dims(tf.range(n_labels, name="successors_range"), axis=0)
+    successors.set_shape((1, n_labels))
+  assert isinstance(successors, tf.Tensor)
+  successors.set_shape((None, None))
+  last_row = edit_distance_via_next_edit_distance_row(a, a_len, b, b_len, full_row_output=True)
+  return next_edit_distance_reduce(
+    last_row,
+    a=successors, a_n=tf.shape(a)[1], a_ended=tf.not_equal(tf.shape(a)[1], a_len),
+    b=b, b_len=b_len,
+    optimal_completion=True)
+
+
 def _debug_dumped_fast_baum_welch(prefix, postfix=".dump"):
   """
   If you uncomment the debug_print statements in FastBaumWelchOp, as well as dump_to_file inside debug_print,
