@@ -1475,43 +1475,45 @@ def _create_data(n_batch, n_time, n_feature, network, dtype=tf.int32, offset=0, 
   src.output.size_placeholder = src_size_placeholder
   return src
 
+def _construct_vocab(num_entries, vocab_path="/tmp/vocab.pkl"):
+  # construct vocabulary:
+  vocab = {str(i): i for i in range(num_entries)}
+  vocab["</S>"] = max(vocab.values()) + 1
+  vocab["</T>"] = max(vocab.values()) + 1
+  vocab["</M>"] = max(vocab.values()) + 1
+  import pickle as pkl
+  with open(vocab_path, 'wb') as f:
+    pkl.dump(vocab, f)
+  return vocab
 
 def test_BERTMaskLayer():
-  _test_ProbabilisticMaskLayer(bil=False, with_prob=False, mask_src_factor=(0.0, 1.0), mask_trg_factor=(0.13, 3.694), mask_pad_factor=(0.0, 2.0))
-  _test_ProbabilisticMaskLayer(bil=False, with_prob=True)
-  _test_ProbabilisticMaskLayer(bil=False, with_prob=False)
-  _test_ProbabilisticMaskLayer(bil=True, with_prob=True)
-  _test_ProbabilisticMaskLayer(bil=True, with_prob=False)
-  _test_ProbabilisticMaskLayer(bil=False, with_prob=False, n_feature=100)
-  _test_ProbabilisticMaskLayer_fixed(bil=False, fixed_src_mask=True, fixed_trg_mask=False)
-  _test_ProbabilisticMaskLayer_fixed(bil=True, fixed_src_mask=True, fixed_trg_mask=False)
-  _test_ProbabilisticMaskLayer_fixed(bil=True, fixed_src_mask=False, fixed_trg_mask=True)
-  _test_ProbabilisticMaskLayer_fixed(bil=True, fixed_src_mask=True, fixed_trg_mask=True)
+  _test_ProbabilisticMaskLayer(with_prob=False, mask_factor=(0.0, 1.0))
+  _test_ProbabilisticMaskLayer(with_prob=True)
+  _test_ProbabilisticMaskLayer(with_prob=False)
+  _test_ProbabilisticMaskLayer(with_prob=False, n_feature=100)
+  _test_ProbabilisticMaskLayer(fixed_mask=True, mask_factor=1.0, with_prob=False)
 
 
-def _test_ProbabilisticMaskLayer(bil=False, with_prob=True, n_batch=5, n_time=20, n_feature=120,
-                                 mask_src_factor=0.8, mask_trg_factor=1.1, mask_pad_factor=0.2):
-  print("Test mask layer with bil_data=%s, with_prob=%s, n_batch=%s, n_time=%s, n_feature=%s, "
-        "mask_src_factor=%s, mask_trg_factor=%s, mask_pad_factor=%s" % (
-        bil, with_prob, n_batch, n_time, n_feature, mask_src_factor, mask_trg_factor, mask_pad_factor))
+def _test_ProbabilisticMaskLayer(with_prob=True, n_batch=5, n_time=20, n_feature=120,
+                                 mask_factor=0.8, fixed_mask=False):
+  print("Test mask layer with with_prob=%s, n_batch=%s, n_time=%s, n_feature=%s, "
+        "mask_factor=%s, fixed_mask=%s" % (with_prob, n_batch, n_time, n_feature, mask_factor, fixed_mask))
   import numpy as np
   with make_scope() as session:
     network = TFNetwork(train_flag=True, extern_data=ExternData())
     src = _create_data(n_batch=n_batch, n_time=n_time, n_feature=n_feature, network=network)
-    if bil:
-      trg = _create_data(n_batch=n_batch, n_time=n_time+7, n_feature=n_feature+(7*n_batch), offset=n_batch*n_time, network=network)
-      vocab = {str(i): i for i in range(n_time*n_batch+(n_time+7)*n_batch)}
-    else:
-      trg = None
-      vocab = {str(i): i for i in range(n_time*n_batch)}
+    if fixed_mask:
+      src_mask_arr = np.random.randint(-1,3,(n_batch,n_time,1),dtype=np.int32)
+      mask_tensor = tf.convert_to_tensor(src_mask_arr)
+      fixed_mask = InternalLayer(
+        name="pos", network=network,
+        output=Data(
+          name="src_mask_output", shape=(None, 1), placeholder=mask_tensor,
+          time_dim_axis=1,
+        size_placeholder=src.output.size_placeholder))
 
     # construct vocabulary:
-    vocab["</S>"] = max(vocab.values()) + 1
-    vocab["</T>"] = max(vocab.values()) + 1
-    vocab["</M>"] = max(vocab.values()) + 1
-    import pickle as pkl
-    with open("/tmp/vocab.pkl", 'wb') as f:
-      pkl.dump(vocab, f)
+    vocab = _construct_vocab(n_time*n_batch)
     if with_prob:
       vocab_prob = {w: 1/(1000*n_time*n_batch) for w in vocab.keys()}
       vocab_prob['8'] = 1
@@ -1521,17 +1523,15 @@ def _test_ProbabilisticMaskLayer(bil=False, with_prob=True, n_batch=5, n_time=20
 
     # construct layer:
     settings = {"name":"out",
-                  "sources": [src, trg] if trg else [src],
+                  "sources": [src],
                   "network": network,
                   "vocab": "/tmp/vocab.pkl",
                   "vocab_probs": "/tmp/vocab_probs.pkl" if with_prob else None,
-                  "max_seq_len": 25,
                   "mask_prob": 0.2,
                   "mask_m_prob": 0.7,
                   "mask_r_prob": 0.1,
-                  "mask_src_factor": mask_src_factor,
-                  "mask_trg_factor": mask_trg_factor,
-                  "mask_pad_factor": mask_pad_factor,
+                  "mask_factor": mask_factor,
+                  "fixed_seq_mask": fixed_mask if fixed_mask is not False else None,
                   "random_seed": None}
     out_output = ProbabilisticMaskLayer.get_out_data_from_opts(**settings)
     out = ProbabilisticMaskLayer(output=out_output, **settings)
@@ -1543,127 +1543,19 @@ def _test_ProbabilisticMaskLayer(bil=False, with_prob=True, n_batch=5, n_time=20
        labels.output.placeholder,
        positions.output.placeholder,
        positions.output.get_sequence_lengths()]
-    to_inspect += [trg.output.placeholder, trg.output.get_sequence_lengths()] if bil else []
     results = session.run(to_inspect)
     src_res, src_lens_res, out_res, labels_res, positions_res, num_positions_res = results[:6]
-    if bil:
-      trg_res, trg_lens_res = results[6:8]
 
-    if not (isinstance(mask_src_factor, tuple) or isinstance(mask_trg_factor, tuple) or isinstance(mask_pad_factor, tuple)):
+    if not isinstance(mask_factor, tuple) and not fixed_mask:
         print("Check if right percentage was masked:", end=" ")
         for i in range(n_batch):
-          if bil:
-            num_to_modify = max(1,int(round((src_lens_res[i]-1) * settings.get("mask_prob") * settings.get("mask_src_factor"))))
-            num_to_modify += max(1,int(round((trg_lens_res[i]+1) * settings.get("mask_prob") * settings.get("mask_trg_factor"))))
-            num_to_modify += max(1,int(round((min(settings.get("max_seq_len"),3*src_lens_res[i])-trg_lens_res[i])
-                                             * settings.get("mask_prob") * settings.get("mask_pad_factor"))))
-          else:
-            num_to_modify = max(1,int(round(src_lens_res[i] * settings.get("mask_prob") * settings.get("mask_src_factor"))))
+          num_to_modify = max(1,int(round(src_lens_res[i] * settings.get("mask_prob") * settings.get("mask_factor"))))
           assert_equal(num_positions_res[i],
                        num_to_modify,
                        "Total number of mask positions incorrect")
 
-    print("Check if we could reconstruct the original sequence:", end=" ")
-    for i in range(n_batch):
-      un_masked_seq = out_res[i]
-      for j in range(num_positions_res[i]):
-        un_masked_seq[positions_res[i,j]] = labels_res[i,j]
-      if bil:
-        assert np.all(un_masked_seq[:src_lens_res[i]-1] == src_res[i][:src_lens_res[i]-1]), (
-          "Was unable to reconstruct original sequence")
-        assert un_masked_seq[src_lens_res[i]-1] == vocab["</T>"], (
-          "Was unable to reconstruct separation token")
-        assert np.all(un_masked_seq[src_lens_res[i]:src_lens_res[i]+trg_lens_res[i]] == trg_res[i][:trg_lens_res[i]]), (
-          "Was unable to reconstruct original target sequence")
-      else:
-        assert np.all(un_masked_seq[:src_lens_res[i]] == src_res[i][:src_lens_res[i]]), (
-          "Was unable to reconstruct original sequence")
-    print(u'\N{check mark}')
 
-    print("Check shapes:", end=" ")
-    assert np.alltrue(positions_res.shape[:2] == labels_res.shape[:2]), (
-      "positions shape[:2] %r =/= labels shape[:2] %r" %(positions_res.shape[:2], labels_res.shape[:2]))
-    assert np.alltrue(src_res.shape[2:] == labels_res.shape[2:]), (
-      "src shape[2:] %r =/= labels shape[2:] %r" %(src_res.shape[2:], labels_res.shape[2:]))
-    print(u'\N{check mark}')
-
-
-def _test_ProbabilisticMaskLayer_fixed(bil=False, n_batch=4, n_time=5, n_feature=20,
-                                 fixed_src_mask=True, fixed_trg_mask=True, mask_pad_factor=0.2):
-  print("Test mask layer with bil_data=%s, n_batch=%s, n_time=%s, n_feature=%s, "
-        "fixed_src_mask=%s, fixed_trg_mask=%s, mask_pad_factor=%s" % (
-        bil, n_batch, n_time, n_feature, fixed_src_mask, fixed_trg_mask, mask_pad_factor))
-  import numpy as np
-  with make_scope() as session:
-    network = TFNetwork(train_flag=True, extern_data=ExternData())
-    src = _create_data(n_batch=n_batch, n_time=n_time, n_feature=n_feature, network=network)
-    if fixed_src_mask:
-      src_mask_arr = np.random.randint(-1,3,(n_batch,n_time,1),dtype=np.int32)
-      mask_tensor = tf.convert_to_tensor(src_mask_arr)
-      fixed_src_mask = InternalLayer(
-        name="pos", network=network,
-        output=Data(
-          name="src_mask_output", shape=(None, 1), placeholder=mask_tensor,
-          time_dim_axis=1,
-        size_placeholder=src.output.size_placeholder))
-
-    if bil:
-      trg = _create_data(n_batch=n_batch, n_time=n_time+7, n_feature=n_feature + (7*n_batch), offset=n_batch*n_time, network=network)
-      vocab = {str(i): i for i in range(n_time*n_batch+(n_time+7)*n_batch)}
-      if fixed_trg_mask:
-        trg_mask_arr = np.random.randint(-1,3,(n_batch,n_time+7+1,1),dtype=np.int32)
-        mask_tensor = tf.convert_to_tensor(trg_mask_arr)
-        fixed_trg_mask = InternalLayer(
-            name="pos", network=network,
-            output=Data(
-              name="trg_mask_output", shape=(None, 1), placeholder=mask_tensor,
-              time_dim_axis=1,
-            size_placeholder=trg.output.size_placeholder))
-    else:
-      trg = None
-      vocab = {str(i): i for i in range(n_time*n_batch)}
-
-    # construct vocabulary:
-    vocab["</S>"] = max(vocab.values()) + 1
-    vocab["</T>"] = max(vocab.values()) + 1
-    vocab["</M>"] = max(vocab.values()) + 1
-    import pickle as pkl
-    with open("/tmp/vocab.pkl", 'wb') as f:
-      pkl.dump(vocab, f)
-
-    # construct layer:
-    settings = {"name": "out",
-                "sources": [src, trg] if trg else [src],
-                "network": network,
-                "vocab": "/tmp/vocab.pkl",
-                "vocab_probs": None,
-                "max_seq_len": 25,
-                "mask_prob": 0.2,
-                "mask_m_prob": 0.7,
-                "mask_r_prob": 0.1,
-                "mask_src_factor": 1.0,
-                "mask_trg_factor": 1.0,
-                "fixed_src_mask": fixed_src_mask if fixed_src_mask is not False else None,
-                "fixed_trg_mask": fixed_trg_mask if fixed_trg_mask is not False else None,
-                "mask_pad_factor": mask_pad_factor,
-                "random_seed": None}
-    out_output = ProbabilisticMaskLayer.get_out_data_from_opts(**settings)
-    out = ProbabilisticMaskLayer(output=out_output, **settings)
-    labels = out.get_sub_layer("labels")
-    positions = out.get_sub_layer("positions")
-    to_inspect = [src.output.placeholder,
-       src.output.get_sequence_lengths(),
-       out.output.placeholder,
-       labels.output.placeholder,
-       positions.output.placeholder,
-       positions.output.get_sequence_lengths()]
-    to_inspect += [trg.output.placeholder, trg.output.get_sequence_lengths()] if bil else []
-    results = session.run(to_inspect)
-    src_res, src_lens_res, out_res, labels_res, positions_res, num_positions_res = results[:6]
-    if bil:
-      trg_res, trg_lens_res = results[6:8]
-
-    if fixed_src_mask is not False:
+    if fixed_mask is not False:
       print("Check if we really applied the given source mask:", end=" ")
       for i in range(n_batch):
         for j in range(src_lens_res[i]-1):
@@ -1677,34 +1569,12 @@ def _test_ProbabilisticMaskLayer_fixed(bil=False, n_batch=4, n_time=5, n_feature
               assert np.all(out_res[i,j] == src_res[i,j])
       print(u'\N{check mark}')
 
-    if fixed_trg_mask is not False:
-      print("Check if we really applied the given target mask:", end=" ")
-      for i in range(n_batch):
-        for j in range(1,trg_lens_res[i]+1):
-          if trg_mask_arr[i,j] == -1:
-            assert j+src_lens_res[i]-1 not in positions_res[i][:num_positions_res[i]]
-          else:
-            assert j+src_lens_res[i]-1 in positions_res[i][:num_positions_res[i]]
-            if trg_mask_arr[i,j] == 0:
-              assert np.all(out_res[i,j+src_lens_res[i]-1] == vocab["</M>"])
-            if trg_mask_arr[i,j] == 2:
-              assert np.all(out_res[i,j+src_lens_res[i]-1] == trg_res[i,j-1])
-      print(u'\N{check mark}')
-
     print("Check if we could reconstruct the original sequence:", end=" ")
     for i in range(n_batch):
       un_masked_seq = out_res[i]
       for j in range(num_positions_res[i]):
         un_masked_seq[positions_res[i,j]] = labels_res[i,j]
-      if bil:
-        assert np.all(un_masked_seq[:src_lens_res[i]-1] == src_res[i][:src_lens_res[i]-1]), (
-          "Was unable to reconstruct original sequence")
-        assert un_masked_seq[src_lens_res[i]-1] == vocab["</T>"], (
-          "Was unable to reconstruct separation token")
-        assert np.all(un_masked_seq[src_lens_res[i]:src_lens_res[i]+trg_lens_res[i]] == trg_res[i][:trg_lens_res[i]]), (
-          "Was unable to reconstruct original target sequence")
-      else:
-        assert np.all(un_masked_seq[:src_lens_res[i]] == src_res[i][:src_lens_res[i]]), (
+      assert np.all(un_masked_seq[:src_lens_res[i]] == src_res[i][:src_lens_res[i]]), (
           "Was unable to reconstruct original sequence")
     print(u'\N{check mark}')
 
@@ -1716,28 +1586,16 @@ def _test_ProbabilisticMaskLayer_fixed(bil=False, n_batch=4, n_time=5, n_feature
     print(u'\N{check mark}')
 
 
-def test_mask_and_gather(bil=False, with_prob=False, n_batch=10, n_time=11, n_feature=400):
-  print("Test mask and gather layer jointly with bil_data=%s, with_prob=%s, "
-        "n_batch=%s, n_time=%s, n_feature=%s" % (bil, with_prob, n_batch, n_time, n_feature))
+def test_mask_and_gather(with_prob=False, n_batch=10, n_time=11, n_feature=400):
+  print("Test mask and gather layer jointly with with_prob=%s, "
+        "n_batch=%s, n_time=%s, n_feature=%s" % (with_prob, n_batch, n_time, n_feature))
   import numpy as np
   with make_scope() as session:
     network = TFNetwork(train_flag=True, extern_data=ExternData())
     src_sparse = _create_data(n_batch=n_batch, n_time=n_time, n_feature=n_feature, network=network)
     src = _create_data(n_batch=n_batch, n_time=n_time, n_feature=1, network=network, sparse=False)
-    if bil:
-      trg = _create_data(n_batch=n_batch, n_time=n_time+7, n_feature=n_feature, offset=n_batch*n_time, network=network)
-      vocab = {str(i): i for i in range(n_time*n_batch+(n_time+7)*n_batch)}
-    else:
-      trg = None
-      vocab = {str(i): i for i in range(n_time*n_batch)}
 
-    # construct vocabulary:
-    vocab["</S>"] = max(vocab.values()) + 1
-    vocab["</T>"] = max(vocab.values()) + 1
-    vocab["</M>"] = max(vocab.values()) + 1
-    import pickle as pkl
-    with open("/tmp/vocab.pkl", 'wb') as f:
-      pkl.dump(vocab, f)
+    vocab = _construct_vocab(n_time*n_batch)
     if with_prob:
       vocab_prob = {w: 1/(1000*n_time*n_batch) for w in vocab.keys()}
       vocab_prob['8'] = 1
@@ -1747,16 +1605,13 @@ def test_mask_and_gather(bil=False, with_prob=False, n_batch=10, n_time=11, n_fe
 
     # construct layer:
     settings = {"name":"out",
-                  "sources": [src_sparse,trg] if trg else [src_sparse],
+                  "sources": [src_sparse],
                   "network": network,
                   "vocab": "/tmp/vocab.pkl",
                   "vocab_probs": "/tmp/vocab_probs.pkl" if with_prob else None,
-                  "max_seq_len": 25,
                   "mask_prob": 0.2,
                   "mask_m_prob": 0.7,
                   "mask_r_prob": 0.1,
-                  "mask_trg_factor": 1.1,
-                  "mask_pad_factor": 0.2,
                   "random_seed": None}
     mask_out_output = ProbabilisticMaskLayer.get_out_data_from_opts(**settings)
     mask_out = ProbabilisticMaskLayer(output=mask_out_output, **settings)
@@ -1777,11 +1632,8 @@ def test_mask_and_gather(bil=False, with_prob=False, n_batch=10, n_time=11, n_fe
                   labels.output.placeholder,
                   positions.output.placeholder,
                   positions.output.get_sequence_lengths()]
-    to_inspect += [trg.output.placeholder, trg.output.get_sequence_lengths()] if bil else []
     results = session.run(to_inspect)
     src_res, src_lens_res, out_res, out_lens_res, labels_res, positions_res, num_positions_res = results[:7]
-    if bil:
-      trg_res, trg_lens_res = results[7:9]
 
     # check the results:
     print("Check if we recovered the labels correctly:", end=" ")
@@ -1849,6 +1701,82 @@ def test_GatherPositionsLayer(n_batch = 3, n_time = 10, n_feature = 8, n_mask = 
     assert np.alltrue(src_res.shape[2:] == out_res.shape[2:]), (
       "src shape[2:] %r =/= output shape[2:] %r" %(src_res.shape[2:], out_res.shape[2:]))
     print(u'\N{check mark}')
+
+def test_masked_lm_net(n_time=3, n_batch=2, n_feature=20):
+  with make_scope() as session:
+    vocab_path = "/tmp/vocab.pkl"
+    vocab = _construct_vocab(n_time * n_batch, vocab_path)
+    config = Config()
+    config.update({
+      "num_inputs": n_feature,
+      "num_outputs": {"classes": n_feature, "data": n_feature},
+      "network": {
+        "src_mask": {"class": "probabilistic_mask", "from": ["data"], "vocab": vocab_path},
+        "gather": {"class": "gather_positions", "from": ["data", "src_mask/positions"], "is_output_layer": True},
+      }})
+    network = TFNetwork(config=config, train_flag=True)
+    network.construct_from_dict(config.typed_value("network"))
+    src_sparse = _create_data(n_batch=n_batch, n_time=n_time, n_feature=n_feature, network=network)
+    src = _create_data(n_batch=n_batch, n_time=n_time, n_feature=1, network=network, sparse=False)
+    session.run(tf.global_variables_initializer())
+    labels = network.layers["src_mask"].get_sub_layer("labels").output.placeholder
+    positions = network.layers["src_mask"].get_sub_layer("positions").output.placeholder
+    out = network.layers["gather"].output.placeholder
+    out_lens = network.layers["gather"].output.get_sequence_lengths()
+    n_batch = 1
+    seq_len = 3
+    labels_res, positions_res, out_res, out_lens_res, src_res = session.run([labels, positions, out, out_lens, src])
+    # check the results:
+    print("Check if we recovered the labels correctly:", end=" ")
+    for i in range(out_res.shape[0]):
+      for j in range(out_lens_res[i]):
+        assert np.alltrue(out_res[i,j] == labels_res[i,j]), \
+          "Position (%s,%s) not gathered correctly!" %(i,j)
+        assert np.alltrue(out_res[i,j] == src_res[i,positions_res[i,j]]), \
+          "Position (%s,%s) not gathered correctly!" %(i,j)
+    print(u'\N{check mark}')
+
+
+# def test_masked_lm_net(n_time, n_batch, n_feature):
+#   with make_scope() as session:
+#     vocab_path = "/tmp/vocab.pkl"
+#     vocab = _construct_vocab(n_time*n_batch, vocab_path)
+#     config = Config()
+#     config.update({
+#       "num_outputs": {"classes": n_feature, "data": n_feature},
+#       "num_inputs": {"classes": n_feature, "data": n_feature},
+#       "network": {
+#         "padding": {"class": "generate_padding_to_match_seq", "from": ["data:classes","data"]},
+#         "separator": {"class": "constant", "value": vocab.get("</T>"), "dtype": "int32"},
+#
+#         "src_mask": {"class": "probabilistic_mask", "from": ["data"], "vocab": vocab_path},
+#         "sep_mask": {"class": "probabilistic_mask", "from": ["separator"], "vocab": vocab_path},
+#         "trg_mask": {"class": "probabilistic_mask", "from": ["data:classes"], "vocab": vocab_path},
+#         "pad_mask": {"class": "probabilistic_mask", "from": ["padding"], "vocab": vocab_path},
+#
+#         "un_masked_seq": {"class": "concat_sequences", "from": ["data","separator","data:classes","padding"]},
+#         "masked_seq": {"class": "concat_sequences", "from": ["src_mask","sep_mask","trg_mask","pad_mask"]},
+#         "labels": {"class": "concat_sequences",
+#                    "from": ["src_mask/labels","sep_mask/labels","trg_mask/labels","pad_mask/labels"]},
+#         "positions": {"class": "concat_sequences",
+#                       "from": ["src_mask/positions","sep_mask/positions","trg_mask/positions","pad_mask/positions"],
+#                       "add_offset": True},
+#
+#         "gather": {"class": "gather_positions", "from": ["un_masked_seq", "positions"], "is_output_layer": True},
+#       }})
+#     network = TFNetwork(config=config, train_flag=True)
+#     network.construct_from_dict(config.typed_value("network"))
+#     session.run(tf.global_variables_initializer())
+#     out = network.layers["output"].output.placeholder
+#     out2 = network.layers["0out"].output.placeholder
+#     n_batch = 1
+#     seq_len = 3
+#     feed = {network.extern_data.get_default_input_data().placeholder:
+#             numpy.array([[[0, 0], [-1, -1], [2, 2]]], dtype="float32")}
+#     assert_equal(feed[network.extern_data.get_default_input_data().placeholder].shape, (n_batch, seq_len, num_inputs))
+#     v, v2 = session.run([out, out2], feed_dict=feed)
+#     assert_equal(v.shape, (n_batch, seq_len, num_inputs))
+#     assert_equal(v.tolist(), [[[0, 0], [0, 0], [2, 2]]])
 
 
 if __name__ == "__main__":

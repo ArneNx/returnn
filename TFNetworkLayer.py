@@ -7174,19 +7174,13 @@ class ProbabilisticMaskLayer(LayerBase):
   def __init__(self,
                vocab,
                vocab_probs=None,
-               seq_end_symbol="</S>",
                mask_symbol="</M>",
-               separator_symbol="</T>",
-               max_seq_len=100,
                mask_prob=0.15,
-               mask_src_factor=1.0,
-               mask_trg_factor=1.0,
-               mask_pad_factor=0.1,
+               mask_factor=1.0,
                mask_m_prob=0.8,
                mask_r_prob=0.1,
                random_seed=42,
-               fixed_src_mask=None,
-               fixed_trg_mask=None,
+               fixed_seq_mask=None,
                *args,
                **kwargs):
     """
@@ -7196,8 +7190,8 @@ class ProbabilisticMaskLayer(LayerBase):
     each individual token in a sequence in form {"word": prob}
     :param str seq_end_symbol: token to end each sequence
     :param str mask_symbol: token to mask with
-    :param str separator_symbol: token to separate src and target sequence (if target sequence is given)
-    :param int max_seq_len: positive integer to set an upper bound on the length of a sequence (src/trg individually)
+    :param str separator_symbol: token to separate seqs and target sequence (if target sequence is given)
+    :param int max_seq_len: positive integer to set an upper bound on the length of a sequence (seqs/trg individually)
     :param float mask_prob: float in range (0,1) to specify probability for each token in the sequence to be masked
     :param float|tuple[float] mask_src_factor: mask_prob for the source sequence is mask_src_factor * mask_prob
     if mask_src_factor is a tuple, mask_src_factor=uniform_random(mask_src_factor[0],mask_src_factor[1]) for each seq
@@ -7207,7 +7201,7 @@ class ProbabilisticMaskLayer(LayerBase):
     if mask_pad_factor is a tuple, mask_pad_factor=uniform_random(mask_pad_factor[0],mask_pad_factor[1]) for each seq
     :param float mask_m_prob: probability that a selected position is replaced by mask token
     :param float mask_r_prob: probability that a selected position is replaced by random token from vocab
-    :param LayerBase|None fixed_src_mask: mask in form of a tensor of src length
+    :param LayerBase|None fixed_seq_mask: mask in form of a tensor of seqs length
     containing 0/1/2/-1 (mask/random/keep/no-mask) for each position
     :param LayerBase|None fixed_trg_mask: mask in form of a tensor of trg length
     containing 0/1/2/-1 (mask/random/keep/no-mask) for each position
@@ -7224,38 +7218,29 @@ class ProbabilisticMaskLayer(LayerBase):
     """
     super(ProbabilisticMaskLayer, self).__init__(*args, **kwargs)
     self.random_seed = random_seed
-    self.max_seq_len = max_seq_len
     self.mask_prob = mask_prob
     self.mask_m_prob = mask_m_prob
     self.mask_r_prob = mask_r_prob
     self.mask_k_prob = 1 - (mask_m_prob + mask_r_prob)
-    self.mask_src_factor = mask_src_factor
-    self.mask_trg_factor = mask_trg_factor
-    self.mask_pad_factor = mask_pad_factor
 
     source_data = self.sources[0].output
-    target_data = self.sources[1].output if len(self.sources)>1 else None
 
     self.vocab = self._read_dict(vocab)
-    self.seq_end_symbol = self.vocab[seq_end_symbol]
     self.mask_symbol = self.vocab[mask_symbol]
-    if target_data is not None:
-      self.separator_symbol = self.vocab[separator_symbol]
     self.vocab_length = max(self.vocab.values()) + 1
     self.vocab_probs = self._get_vocab_probs(vocab_probs)
 
-    src = source_data.get_placeholder_as_batch_major()
-    src_lengths = source_data.get_sequence_lengths()
-    src_mask = fixed_src_mask.output.get_placeholder_as_batch_major() if fixed_src_mask else None
-    trg = target_data.get_placeholder_as_batch_major() if target_data else None
-    trg_lengths = target_data.get_sequence_lengths() if target_data else None
-    trg_mask = fixed_trg_mask.output.get_placeholder_as_batch_major() if fixed_trg_mask else None
+    seqs = source_data.get_placeholder_as_batch_major()
+    seq_lengths = source_data.get_sequence_lengths()
+    seq_mask = fixed_seq_mask.output.get_placeholder_as_batch_major() if fixed_seq_mask else None
+    if isinstance(mask_factor, tuple):
+      # if this a tuple -> factor is selected uniformly at random from range [mask_factor[0],mask_factor[1])
+      mask_prob = tf.constant(mask_prob) * tf.random_uniform([], mask_factor[0], mask_factor[1], seed=self.random_seed)
+    else:
+      #   if this is a scalar -> multiply with self.mask_prob
+      mask_prob = tf.constant(mask_prob) * tf.constant(mask_factor)
 
-
-    masked_sequence, labels, positions, num_positions, masked_seq_lens = self._construct_masked_seq(src, src_lengths,
-                                                                                                    trg, trg_lengths,
-                                                                                                    src_mask, trg_mask
-                                                                                                    )
+    masked_sequence, labels, positions, num_positions = self._mask_seq(seqs, mask_prob, seq_lengths, seq_mask)
     self.output_dict = {
       "masked_sequence": masked_sequence,
       "labels": labels,
@@ -7264,12 +7249,117 @@ class ProbabilisticMaskLayer(LayerBase):
     }
     self.output.placeholder = masked_sequence
     self.output.size_placeholder = source_data.size_placeholder.copy()
-    self.output.size_placeholder[0] = masked_seq_lens
+    self.output.size_placeholder[0] = seq_lengths
+
+  def _mask_seq(self, seqs, mask_prob, seq_lens, fixed_mask):
+    """
+    Creates the masked version of a given batch of sequences,
+    the corresponding positions and labels for the masked LM objective.
+    :param tf.Tensor seqs: shape=(B,T,None) batch of sequences to mask
+    :param tf.constant[float] mask_prob: probability to mask a position in range [0,1)
+    :param tf.Tensor[int32] seq_lens: shape=(B,) length information for each sequence
+    :param tf.Tensor[int32]|None fixed_mask: shape=(B,T) tensor containing 0/1/2/-1 for mask/random/keep/no-mask
+    :return:
+      tf.Tensor masked_inp_tensor: shape=(B,T,None), input sequence that's masked at some positions
+      tf.TensorArray labels_tensor: B * shape=(T[i]*mask_prob,None), correct ('unmasked') labels for those positions
+      tf.TensorArray positions_tensor: B * shape=(num_positions[i],), positions where input was masked
+        (i.e. replaced by mask token/ random token/ kept the same)
+      tf.Tensor num_positions_tensor: shape=(B,), number of masked positions for each sequence
+    :rtype: (tf.Tensor,tf.TensorArray,tf.TensorArray[int32],tf.Tensor[int32])
+    """
+    masked_seqs_array = tf.TensorArray(dtype=seqs.dtype, size=tf.shape(seqs)[0], dynamic_size=False, infer_shape=True)
+    labels_array = tf.TensorArray(dtype=seqs.dtype, size=tf.shape(seqs)[0], dynamic_size=False, infer_shape=False)
+    positions_array = tf.TensorArray(dtype=tf.int32, size=tf.shape(seqs)[0], dynamic_size=False, infer_shape=False)
+    num_positions_array = tf.TensorArray(dtype=tf.int32, size=tf.shape(seqs)[0], dynamic_size=False, infer_shape=True)
+
+    i = tf.constant(0)
+
+    def while_condition(i, masked_seqs_array, labels_array, positions_array, num_positions_array):
+      return tf.less(i, tf.shape(seqs)[0])  # iterate over batches
+
+    def body(i, masked_seqs_array, labels_array, positions_array, num_positions_array):
+      """
+      we have to do this for every sequence individually,
+      since we have to consider the sequence length
+      and we don't want to predict/mask any padding positions
+      however, TF might be able to parallelize this across the batch
+      """
+      if fixed_mask is not None:
+        fixed_mask_i = fixed_mask[i][:seq_lens[i]]
+        selected_indices = tf.cast(tf.where(tf.not_equal(fixed_mask_i, tf.constant(-1)))[:,0], dtype=tf.int32)
+        num_to_predict = tf.shape(selected_indices)[0]
+        choice = tf.gather(fixed_mask_i, selected_indices)
+      else:
+        num_to_predict = tf.maximum(tf.constant(1),
+                                  tf.cast(tf.round(tf.to_float(seq_lens[i]) * mask_prob), dtype=tf.int32))
+        if self.vocab_probs is None:
+          # select num_to_predict positions uniformly at random:
+          selected_indices = tf.range(seq_lens[i], dtype=tf.int32)
+          selected_indices = tf.random_shuffle(selected_indices, seed=self.random_seed)  # randomize positions to select
+          selected_indices = selected_indices[:num_to_predict]  # select mask_prob * seq_len many positions for a loss
+        else:
+          # select num_to_predict positions according to probability assigned to the word:
+          probs = tf.gather(self.vocab_probs, tf.reshape(tf.cast(seqs[i][:seq_lens[i]], dtype=tf.int32), [seq_lens[i]]))
+          logits = tf.log(probs / tf.reduce_sum(probs))
+          selected_indices = TFUtil.sample_without_replacement(logits, num_to_predict, seed=self.random_seed)
+
+        # now calculate what to replace the selected positions with:
+        logits = tf.log(tf.constant([[self.mask_m_prob, self.mask_r_prob, self.mask_k_prob]]))
+        # generate random choices for: 0 = mask, 1 = rnd replace, 2 = keep
+        choice = tf.multinomial(logits, num_to_predict, output_dtype=tf.int32, seed=self.random_seed)
+
+      labels_i = tf.gather(seqs[i], selected_indices)  # add a label only to selected positions
+
+      shape = [num_to_predict]+list(seqs.shape[2:])
+      choice = tf.reshape(choice, shape)
+
+      # every index with 0 in choice gets replaced by masked_symbol
+      mask_symbol_vector = tf.constant([self.mask_symbol], dtype=seqs.dtype) + tf.zeros(shape, dtype=seqs.dtype)
+      mask_values = tf.where(tf.equal(choice, tf.constant(0)), mask_symbol_vector, labels_i)
+
+      # every index with 1 in choice gets replaced by random symbol from vocabulary
+      rand_vector = tf.random_uniform(shape, minval=0, maxval=self.vocab_length,
+                                      dtype=seqs.dtype, seed=self.random_seed)  # replace with random vocab word
+      mask_values = tf.where(tf.equal(choice, tf.constant(1)), rand_vector, mask_values)
+      # every index with 2 in choice (all remaining) is kept unchanged
+
+      update = tf.scatter_nd(tf.reshape(selected_indices, [-1,1]), mask_values, tf.shape(seqs[i]))
+      bool_mask = tf.cast(tf.scatter_nd(tf.reshape(selected_indices, [-1,1]), tf.ones_like(mask_values, dtype=tf.uint8), tf.shape(seqs[i])),
+                          dtype=tf.bool)
+      masked_seqs_i = tf.where(bool_mask, update, seqs[i])  # copy mask_values to selected_indices in original sequence
+
+      labels_array = labels_array.write(i, labels_i)
+      positions_array = positions_array.write(i, selected_indices)
+      num_positions_array = num_positions_array.write(i, num_to_predict)
+      masked_seqs_array = masked_seqs_array.write(i, masked_seqs_i)
+
+      return [tf.add(i, 1), masked_seqs_array, labels_array, positions_array, num_positions_array]
+
+    _, masked_seqs_array, labels_array, positions_array, num_positions_array = tf.while_loop(while_condition, body,
+                                                                                             [i, masked_seqs_array,
+                                                                                              labels_array,
+                                                                                              positions_array,
+                                                                                              num_positions_array],
+                                                                                             back_prop=False)
+
+    # merge them back together
+    num_positions = num_positions_array.stack()
+    masked_seqs = masked_seqs_array.stack()
+    labels = TFUtil.merge_tensor_array_with_padding(labels_array, num_positions, list(seqs.shape[2:]))
+    positions = TFUtil.merge_tensor_array_with_padding(positions_array, num_positions, [])
+
+
+    return (masked_seqs,  # masked tokens presented as input
+            labels,  # correct ('unmasked') labels for those positions
+            positions,  # positions where input was masked (or random replacement/ kept the same)
+            num_positions # number of masked positions for each sequence
+            )
 
   @classmethod
-  def get_out_data_from_opts(cls, sources, name, target_data=None, max_seq_len=100, mask_prob=0.15, mask_src_factor=1.0,
-                             mask_trg_factor=1.0, mask_pad_factor=0.1, output_name="", *args, **kwargs):
+  def get_out_data_from_opts(cls, sources, name, output_name="", *args, **kwargs):
     shape = sources[0].output.shape
+    if shape == ():
+      shape = (None,)
     data = Data(
       name=name,
       shape=[shape[0],1] if output_name == "positions" else shape,
@@ -7281,8 +7371,6 @@ class ProbabilisticMaskLayer(LayerBase):
       dtype="int32" if output_name == "positions" else sources[0].output.dtype,
       beam_size=sources[0].output.beam_size)
     return data
-    # return super(ProbabilisticMaskLayer, cls).get_out_data_from_opts(n_out=1 if output_name == "positions" else sources[
-    #   0].output.dim)
 
   def get_sub_layer(self, layer_name):
     """
@@ -7300,9 +7388,10 @@ class ProbabilisticMaskLayer(LayerBase):
     full_layer_name = self.name + '/' + layer_name
 
     output = self.get_out_data_from_opts(output_name=layer_name, sources=self.sources, name=full_layer_name,
-                                         max_seq_len=self.max_seq_len,
-                                         mask_prob=self.mask_prob, mask_tar_factor=self.mask_trg_factor,
-                                         mask_pad_factor=self.mask_pad_factor)
+                                         # max_seq_len=self.max_seq_len,
+                                         mask_prob=self.mask_prob)
+                                         #mask_tar_factor=self.mask_trg_factor,
+                                         #mask_pad_factor=self.mask_pad_factor)
 
     from TFNetworkLayer import InternalLayer
     sub_layer = InternalLayer(name=full_layer_name, output=output, network=self.network, sources=[self])
@@ -7363,202 +7452,111 @@ class ProbabilisticMaskLayer(LayerBase):
     vocab_probs_tensor = tf.convert_to_tensor(vocab_probs_tensor)
     return vocab_probs_tensor
 
-  def _mask_seq(self, seq, mask_prob, seq_lens, fixed_mask):
-    """
-    Creates the masked version of a given batch of sequences,
-    the corresponding positions and labels for the masked LM objective.
-    :param tf.Tensor seq: shape=(B,T,None) batch of sequences to mask
-    :param tf.constant[float] mask_prob: probability to mask a position in range [0,1)
-    :param tf.Tensor[int32] seq_lens: shape=(B,) length information for each sequence
-    :param tf.Tensor[int32]|None fixed_mask: shape=(B,T) tensor containing 0/1/2/-1 for mask/random/keep/no-mask
-    :return:
-      tf.Tensor masked_inp_tensor: shape=(B,T,None), input sequence that's masked at some positions
-      tf.TensorArray labels_tensor: B * shape=(T[i]*mask_prob,None), correct ('unmasked') labels for those positions
-      tf.TensorArray positions_tensor: B * shape=(num_positions[i],), positions where input was masked
-        (i.e. replaced by mask token/ random token/ kept the same)
-      tf.Tensor num_positions_tensor: shape=(B,), number of masked positions for each sequence
-    :rtype: (tf.Tensor,tf.TensorArray,tf.TensorArray[int32],tf.Tensor[int32])
-    """
-    masked_inp = tf.TensorArray(dtype=seq.dtype, size=tf.shape(seq)[0], dynamic_size=False, infer_shape=True)
-    labels = tf.TensorArray(dtype=seq.dtype, size=tf.shape(seq)[0], dynamic_size=False, infer_shape=False)
-    positions = tf.TensorArray(dtype=tf.int32, size=tf.shape(seq)[0], dynamic_size=False, infer_shape=False)
-    num_positions = tf.TensorArray(dtype=tf.int32, size=tf.shape(seq)[0], dynamic_size=False, infer_shape=True)
+class GeneratePaddingToMatchSeq(LayerBase):
+  """
+  This layer generates and returns just the padding (not adding to the input!)
+  for a given sequence (sources[0]) s.t. it would match length_factor times the length of
+  the second sequence (sources[1]) or max_seq_length (if given)
+  """
+  layer_class = "generate_padding_to_match_seq"
 
+  def __init__(self, length_factor=3, max_seq_length=None, pad_value=0, *args, **kwargs):
+    """
+    :param length_factor:
+    :param max_seq_length:
+    :param args:
+    :param kwargs:
+    """
+    super(GeneratePaddingToMatchSeq, self).__init__(*args, **kwargs)
+    if max_seq_length is None:
+      import sys
+      max_seq_length = sys.maxint
+    lengths_input = self.sources[0].output.get_sequence_lengths()
+    lengths_to_match = self.sources[1].output.get_sequence_lengths()
+    to_match = self.sources[1].output
+    pad_lengths = tf.maximum(tf.minimum(max_seq_length, lengths_to_match * length_factor) - lengths_input, tf.constant(1))
+    pad = tf.ones([to_match.shape[0], tf.Dimension(length_factor) * to_match.shape[1]] + list(to_match.shape[2:]),
+                  dtype=to_match.dtype) * pad_value
+
+    self.output.placeholder = pad
+    self.output.size_placeholder = self.sources[0].output.size_placeholder.copy()
+    self.output.size_placeholder[0] = pad_lengths
+
+  @classmethod
+  def get_out_data_from_opts(cls, sources, name, *args, **kwargs):
+    data = Data(
+      name=name,
+      shape=sources[0].output.shape,
+      dim=sources[0].output.dim,
+      sparse=sources[0].sparse,
+      batch_dim_axis=sources[0].output.batch_dim_axis,
+      time_dim_axis=sources[0].output.time_dim_axis,
+      feature_dim_axis=sources[0].output.feature_dim_axis_or_unspecified,
+      dtype=sources[0].output.dtype,
+      beam_size=sources[0].output.beam_size)
+    return data
+
+class ConcatSequencesLayer(LayerBase):
+  """
+  This layer concatenates given inputs in sources along the time axis,
+  while considering the individual sequence lengths and padding.
+  Optionally an offset (+ seq_length(sources[i]) for sources[i+1]) will be applied.
+  """
+  layer_class = "concat_sequences"
+
+  def __init__(self,
+               add_offset=False,
+               *args,
+               **kwargs):
+    """
+
+    :param add_offset:
+    :param args:
+    :param kwargs:
+    """
+    super(ConcatSequencesLayer, self).__init__(*args, **kwargs)
+    batch_size = self.sources[0].output.get_batch_dim()
+    combined_seqs_array = tf.TensorArray(dtype=tf.int32, size=batch_size, dynamic_size=False, infer_shape=False)
     i = tf.constant(0)
 
-    def while_condition(i, masked_inp, labels, positions, num_positions):
-      return tf.less(i, tf.shape(seq)[0])  # iterate over batches
+    def while_condition(i, combined_seqs_array):
+      return tf.less(i, batch_size)
 
-    def body(i, masked_inp, labels, positions, num_positions):
-      """
-      we have to do this for every sequence individually,
-      since we have to consider the sequence length
-      and we don't want to predict/mask any padding positions
-      however, TF might be able to parallelize this across the batch
-      """
-      if fixed_mask is not None:
-        fixed_mask_i = fixed_mask[i][:seq_lens[i]]
-        selected_indices = tf.cast(tf.where(tf.not_equal(fixed_mask_i, tf.constant(-1)))[:,0], dtype=tf.int32)
-        num_to_predict = tf.shape(selected_indices)[0]
-        choice = tf.gather(fixed_mask_i, selected_indices)
-      else:
-        num_to_predict = tf.maximum(tf.constant(1),
-                                  tf.cast(tf.round(tf.to_float(seq_lens[i]) * mask_prob), dtype=tf.int32))
-        if self.vocab_probs is None:
-          # select num_to_predict positions uniformly at random:
-          selected_indices = tf.range(seq_lens[i], dtype=tf.int32)
-          selected_indices = tf.random_shuffle(selected_indices, seed=self.random_seed)  # randomize positions to select
-          selected_indices = selected_indices[:num_to_predict]  # select mask_prob * seq_len many positions for a loss
-        else:
-          # select num_to_predict positions according to probability assigned to the word:
-          probs = tf.gather(self.vocab_probs, tf.reshape(tf.cast(seq[i][:seq_lens[i]],dtype=tf.int32), [seq_lens[i]]))
-          logits = tf.log(probs / tf.reduce_sum(probs))
-          selected_indices = TFUtil.sample_without_replacement(logits, num_to_predict, seed=self.random_seed)
+    def body(i, combined_seqs_array):
+      seqs_to_combine = []
+      for j in range(len(self.sources)):
+        length_ji = self.sources[j].output.get_sequence_lengths()[i]
+        seq_ji = self.sources[j].output[i][:length_ji]
+        if add_offset:
+          for k in range(j):
+            seq_ji += self.sources[k].output.get_sequence_lengths()[i]
+        seqs_to_combine.append(seq_ji)
+      combined_seqs_i = tf.concat(seqs_to_combine, 0)
+      combined_seqs_array = combined_seqs_array.write(i, combined_seqs_i)
+      return [tf.add(i, 1), combined_seqs_array]
+    _, combined_seqs_array = tf.while_loop(while_condition, body,
+                                         [i, combined_seqs_array],
+                                         back_prop=False)
 
-        # now calculate what to replace the selected positions with:
-        logits = tf.log(tf.constant([[self.mask_m_prob, self.mask_r_prob, self.mask_k_prob]]))
-        # generate random choices for: 0 = mask, 1 = rnd replace, 2 = keep
-        choice = tf.multinomial(logits, num_to_predict, output_dtype=tf.int32, seed=self.random_seed)
+    combined_lengths = tf.const(0)
+    for j in range(len(self.sources)):
+      combined_lengths = tf.add(self.sources[j].output.get_sequence_lengths())
+    combined_seqs = TFUtil.merge_tensor_array_with_padding(combined_seqs_array, combined_lengths, list(self.sources[0].output.shape[2:]))
 
-      labels_i = tf.gather(seq[i], selected_indices)  # add a label only to selected positions
+    self.output.placeholder = combined_seqs
+    self.output.size_placeholder = self.sources[0].output.size_placeholder.copy()
+    self.output.size_placeholder[0] = combined_lengths
 
-      shape = [num_to_predict]+list(seq.shape[2:])
-      choice = tf.reshape(choice, shape)
-
-      # every index with 0 in choice gets replaced by masked_symbol
-      mask_symbol_vector = tf.constant([self.mask_symbol], dtype=seq.dtype) + tf.zeros(shape, dtype=seq.dtype)
-      mask_values = tf.where(tf.equal(choice, tf.constant(0)), mask_symbol_vector, labels_i)
-
-      # every index with 1 in choice gets replaced by random symbol from vocabulary
-      rand_vector = tf.random_uniform(shape, minval=0, maxval=self.vocab_length,
-                                      dtype=seq.dtype, seed=self.random_seed)  # replace with random vocab word
-      mask_values = tf.where(tf.equal(choice, tf.constant(1)), rand_vector, mask_values)
-      # every index with 2 in choice (all remaining) is kept unchanged
-
-      update = tf.scatter_nd(tf.reshape(selected_indices, [-1,1]), mask_values, tf.shape(seq[i]))
-      bool_mask = tf.cast(tf.scatter_nd(tf.reshape(selected_indices, [-1,1]), tf.ones_like(mask_values, dtype=tf.uint8), tf.shape(seq[i])),
-                          dtype=tf.bool)
-      masked_inp_i = tf.where(bool_mask, update, seq[i])  # copy mask_values to selected_indices in original sequence
-
-      labels = labels.write(i, labels_i)
-      positions = positions.write(i, selected_indices)
-      num_positions = num_positions.write(i, num_to_predict)
-      masked_inp = masked_inp.write(i, masked_inp_i)
-
-      return [tf.add(i, 1), masked_inp, labels, positions, num_positions]
-
-    _, masked_inp, labels, positions, num_positions = tf.while_loop(while_condition, body,
-                                                                    [i, masked_inp, labels, positions, num_positions],
-                                                                    back_prop=False)
-
-    num_positions_tensor = num_positions.stack()
-    masked_inp_tensor = masked_inp.stack()
-
-    return (masked_inp_tensor,  # masked tokens presented as input
-            labels,  # correct ('unmasked') labels for those positions
-            positions,  # positions where input was masked (or random replacement/ kept the same)
-            num_positions_tensor  # number of masked positions for each sequence
-            )
-
-  def _get_mask_prob(self, mask_factor):
-    """
-    Helper function to compute the mask probability
-    :param float|tuple[float] mask_factor:
-    if this is a scalar -> multiply with self.mask_prob
-    if this a tuple -> factor is selected uniformly at random from range [mask_factor[0],mask_factor[1])
-    :return: mask_probability
-    :rtype: tf.cosnstant[tf.float32]
-    """
-    if isinstance(mask_factor, tuple):
-      # sample this factor form a uniform probability (so that the masking varies)
-      return tf.constant(self.mask_prob) * tf.random_uniform([], mask_factor[0], mask_factor[1], seed=self.random_seed)
-    else:
-      return tf.constant(self.mask_prob) * tf.constant(mask_factor)
-
-  def _construct_masked_seq(self, src, src_lengths, trg=None, trg_lengths=None, fixed_src_mask=None, fixed_trg_mask=None):
-    """
-
-    :param tf.Tensor src: shape=(B,T,None) batch of (source) sequences to mask
-    :param list(int) src_lengths: list of sequence lengths for the batch
-    :param tf.Tensor|None trg: optional target sequence to concatenate with source sequence (and padding) if given
-    :param list(int)|None trg_lengths: shape=(B,T_trg,None) list of sequence lengths for the batch of target sequences
-    :param tf.Tensor[tf.int32]|None fixed_src_mask: shape=(B,T) with 0/1/2/-1 in each position for mask/random/keep/no-mask
-    :param tf.Tensor[tf.int32]|None fixed_trg_mask: shape=(B,T_trg+1) with 0/1/2/-1 in each position for mask/random/keep/no-mask
-    :return:
-    src_masked: shape=(B,T',None) masked sequence (combined src + trg + pad if trg given)
-    src_labels: shape=(B,max(num_src_positions),None) labels for masked positions
-    src_positions: shape=(B,max(num_src_positions)) positions corresponding to these labels
-    num_src_positions: shape=(B,) number of positions that were masked in each sequence
-    src_lengths: shape=(B,) length of each masked sequence in the batch
-    :rtype: (tf.Tensor, tf.Tensor, tf.Tensor[tf.int32], tf.Tensor[tf.int32], tf.Tensor[tf.int32])
-    """
-    if trg is not None:
-      src_lengths -= tf.constant(1)  # remove sentence-end token
-
-    src_masked, src_labels_array, src_positions_array, num_src_positions = self._mask_seq(src,
-                                                                                          self._get_mask_prob(
-                                                                                            self.mask_src_factor),
-                                                                                          src_lengths,
-                                                                                          fixed_src_mask)
-    if trg is not None:
-      assert trg_lengths is not None
-      assert trg.dtype == src.dtype
-      sep_symbols = tf.constant(self.separator_symbol, dtype=trg.dtype) \
-                    * tf.ones([trg.shape[0],1]+list(trg.shape[2:]), dtype=trg.dtype)
-      trg = tf.concat([sep_symbols, trg], 1)
-      trg_lengths += tf.constant(1)
-      trg_masked, trg_labels_array, trg_positions_array, num_trg_positions = self._mask_seq(trg,
-                                                                                            self._get_mask_prob(
-                                                                                              self.mask_trg_factor),
-                                                                                            trg_lengths,
-                                                                                            fixed_trg_mask)
-      pad_lengths = tf.maximum(tf.minimum(self.max_seq_len, src_lengths * 3) - trg_lengths, tf.constant(1))
-      pad = tf.ones([trg.shape[0], tf.Dimension(3) * src.shape[1]] + list(trg.shape[2:]),
-                      dtype=trg.dtype) * self.seq_end_symbol
-      pad_masked, pad_labels_array, pad_positions_array, num_pad_positions = self._mask_seq(pad,
-                                                                                            self._get_mask_prob(
-                                                                                              self.mask_pad_factor),
-                                                                                            pad_lengths,
-                                                                                            None)
-
-      i = tf.constant(0)
-      combined_seqs_array = tf.TensorArray(dtype=tf.int32, size=tf.shape(src)[0], dynamic_size=False, infer_shape=False)
-      combined_labels_array = tf.TensorArray(dtype=src.dtype, size=tf.shape(src)[0], dynamic_size=False, infer_shape=False)
-      combined_positions_array = tf.TensorArray(dtype=tf.int32, size=tf.shape(src)[0], dynamic_size=False, infer_shape=False)
-
-      def while_condition(i, combined_labels_array, combined_positions_array, combined_seqs_array):
-        return tf.less(i, src.shape[0])  # iterate over batches
-
-      def body(i, combined_labels_array, combined_positions_array, combined_seqs_array):
-        combined_seqs = tf.concat([src_masked[i][:src_lengths[i]],
-                                   trg_masked[i][:trg_lengths[i]],
-                                   pad_masked[i][:pad_lengths[i]]], 0)
-        combined_seqs_array = combined_seqs_array.write(i, combined_seqs)
-
-        combined_labels = tf.concat([src_labels_array.read(i), trg_labels_array.read(i), pad_labels_array.read(i)], 0)
-        combined_labels_array = combined_labels_array.write(i, combined_labels)
-
-        trg_positions = trg_positions_array.read(i) + src_lengths[i]   # offset to reach trg sentence
-        pad_positions = pad_positions_array.read(i) + src_lengths[i] + trg_lengths[i]  # offset to reach padding
-        combined_positions = tf.concat([src_positions_array.read(i), trg_positions, pad_positions], 0)
-        combined_positions_array = combined_positions_array.write(i, combined_positions)
-
-        return [tf.add(i, 1), combined_labels_array, combined_positions_array, combined_seqs_array]
-
-      _, combined_labels_array, combined_positions_array, combined_seqs_array = tf.while_loop(while_condition, body,
-                                                                 [i, combined_labels_array, combined_positions_array, combined_seqs_array],
-                                                                 back_prop=False)
-      src_lengths += trg_lengths + pad_lengths
-      num_src_positions += num_trg_positions + num_pad_positions
-      src_labels_array = combined_labels_array
-      src_positions_array = combined_positions_array
-      src_masked = TFUtil.merge_tensor_array_with_padding(combined_seqs_array, src_lengths, list(src.shape[2:]))
-
-
-    # add padding to labels and offset to positions:
-    src_labels = TFUtil.merge_tensor_array_with_padding(src_labels_array, num_src_positions, list(src.shape[2:]))
-    src_positions = TFUtil.merge_tensor_array_with_padding(src_positions_array, num_src_positions, [])
-
-    return src_masked, src_labels, src_positions, num_src_positions, src_lengths
-
-
+  @classmethod
+  def get_out_data_from_opts(cls, sources, name, *args, **kwargs):
+    data = Data(
+      name=name,
+      shape=sources[0].output.shape,
+      dim=sources[0].output.dim,
+      sparse=sources[0].sparse,
+      batch_dim_axis=sources[0].output.batch_dim_axis,
+      time_dim_axis=sources[0].output.time_dim_axis,
+      feature_dim_axis=sources[0].output.feature_dim_axis_or_unspecified,
+      dtype=sources[0].output.dtype,
+      beam_size=sources[0].output.beam_size)
+    return data
