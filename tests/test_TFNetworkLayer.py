@@ -1754,6 +1754,7 @@ def _test_ProbabilisticMaskLayer(with_prob=True, n_batch=5, n_time=20, n_feature
       vocab_prob = {w: 1/(1000*n_time*n_batch) for w in vocab.keys()}
       vocab_prob['8'] = 1
       vocab_prob['2'] = 1
+      import pickle as pkl
       with open("/tmp/vocab_probs.pkl", 'wb') as f:
         pkl.dump(vocab_prob, f)
 
@@ -1938,81 +1939,122 @@ def test_GatherPositionsLayer(n_batch = 3, n_time = 10, n_feature = 8, n_mask = 
       "src shape[2:] %r =/= output shape[2:] %r" %(src_res.shape[2:], out_res.shape[2:]))
     print(u'\N{check mark}')
 
-def test_masked_lm_net(n_time=3, n_batch=2, n_feature=20):
-  with make_scope() as session:
-    vocab_path = "/tmp/vocab.pkl"
-    vocab = _construct_vocab(n_time * n_batch, vocab_path)
-    config = Config()
-    config.update({
+
+def test_masked_lm_net(n_time=3, n_batch=2, n_feature=1):
+  numpy.set_printoptions(precision=15)
+  vocab_path = "/tmp/vocab.pkl"
+  vocab = _construct_vocab(n_time * n_batch, vocab_path)
+  config = Config()
+  config.update({
       "num_inputs": n_feature,
-      "num_outputs": {"classes": n_feature, "data": n_feature},
+      "num_outputs": {"data": [n_feature, 1], "classes": [n_feature,2]},
       "network": {
         "src_mask": {"class": "probabilistic_mask", "from": ["data"], "vocab": vocab_path},
-        "gather": {"class": "gather_positions", "from": ["data", "src_mask/positions"], "is_output_layer": True},
+        "gather": {"class": "gather_positions", "from": ["data:classes", "src_mask/positions"], "is_output_layer": True},
       }})
-    network = TFNetwork(config=config, train_flag=True)
-    network.construct_from_dict(config.typed_value("network"))
-    src_sparse = _create_data(n_batch=n_batch, n_time=n_time, n_feature=n_feature, network=network)
-    src = _create_data(n_batch=n_batch, n_time=n_time, n_feature=1, network=network, sparse=False)
-    session.run(tf.global_variables_initializer())
-    labels = network.layers["src_mask"].get_sub_layer("labels").output.placeholder
-    positions = network.layers["src_mask"].get_sub_layer("positions").output.placeholder
-    out = network.layers["gather"].output.placeholder
-    out_lens = network.layers["gather"].output.get_sequence_lengths()
-    n_batch = 1
-    seq_len = 3
-    labels_res, positions_res, out_res, out_lens_res, src_res = session.run([labels, positions, out, out_lens, src])
+  print("Creating network...")
+  network = TFNetwork(config=config, train_flag=True)
+  network.construct_from_dict(config.typed_dict["network"])
+  src_res =numpy.reshape(numpy.arange(n_batch * n_time, dtype=numpy.int32),(n_batch,n_time))
+  src =numpy.reshape(numpy.arange(n_batch * n_time * n_feature, dtype=numpy.int32),(n_batch,n_time, n_feature))
+  feed_dict = {
+      network.extern_data.data["data"].placeholder: src_res,
+      network.extern_data.data["data"].size_placeholder[0]: numpy.array([n_time]*n_batch),
+    network.extern_data.data["classes"].placeholder: src,
+    network.extern_data.data["classes"].size_placeholder[0]: numpy.array([n_time]*n_batch),
+    }
+  labels = network.layers["src_mask"].get_sub_layer("labels").output.placeholder
+  positions = network.layers["src_mask"].get_sub_layer("positions").output.placeholder
+  out = network.layers["gather"].output.placeholder
+  out_lens = network.layers["gather"].output.get_sequence_lengths()
+  print("Creating session...")
+  with tf.Session() as session:
+    print("Init params...")
+    network.initialize_params(session=session)
+    print("Testing prob. mask layer + gather positions ...")
+    labels_res, positions_res, out_res, out_lens_res = session.run([labels, positions, out, out_lens], feed_dict=feed_dict)
     # check the results:
     print("Check if we recovered the labels correctly:", end=" ")
     for i in range(out_res.shape[0]):
       for j in range(out_lens_res[i]):
-        assert np.alltrue(out_res[i,j] == labels_res[i,j]), \
-          "Position (%s,%s) not gathered correctly!" %(i,j)
-        assert np.alltrue(out_res[i,j] == src_res[i,positions_res[i,j]]), \
-          "Position (%s,%s) not gathered correctly!" %(i,j)
+        assert numpy.alltrue(out_res[i,j] == labels_res[i,j]), \
+            "Position (%s,%s) not gathered correctly! %r =/= %r" %(i,j,out_res[i,j],labels_res[i,j])
+        assert numpy.alltrue(out_res[i,j] == src[i,positions_res[i,j]]), \
+              "Position (%s,%s) not gathered correctly! %r =/= %r" %(i,j,out_res[i,j],src[i,positions_res[i,j]])
     print(u'\N{check mark}')
 
 
-# def test_masked_lm_net(n_time, n_batch, n_feature):
-#   with make_scope() as session:
-#     vocab_path = "/tmp/vocab.pkl"
-#     vocab = _construct_vocab(n_time*n_batch, vocab_path)
-#     config = Config()
-#     config.update({
-#       "num_outputs": {"classes": n_feature, "data": n_feature},
-#       "num_inputs": {"classes": n_feature, "data": n_feature},
-#       "network": {
-#         "padding": {"class": "generate_padding_to_match_seq", "from": ["data:classes","data"]},
-#         "separator": {"class": "constant", "value": vocab.get("</T>"), "dtype": "int32"},
-#
-#         "src_mask": {"class": "probabilistic_mask", "from": ["data"], "vocab": vocab_path},
-#         "sep_mask": {"class": "probabilistic_mask", "from": ["separator"], "vocab": vocab_path},
-#         "trg_mask": {"class": "probabilistic_mask", "from": ["data:classes"], "vocab": vocab_path},
-#         "pad_mask": {"class": "probabilistic_mask", "from": ["padding"], "vocab": vocab_path},
-#
-#         "un_masked_seq": {"class": "concat_sequences", "from": ["data","separator","data:classes","padding"]},
-#         "masked_seq": {"class": "concat_sequences", "from": ["src_mask","sep_mask","trg_mask","pad_mask"]},
-#         "labels": {"class": "concat_sequences",
-#                    "from": ["src_mask/labels","sep_mask/labels","trg_mask/labels","pad_mask/labels"]},
-#         "positions": {"class": "concat_sequences",
-#                       "from": ["src_mask/positions","sep_mask/positions","trg_mask/positions","pad_mask/positions"],
-#                       "add_offset": True},
-#
-#         "gather": {"class": "gather_positions", "from": ["un_masked_seq", "positions"], "is_output_layer": True},
-#       }})
-#     network = TFNetwork(config=config, train_flag=True)
-#     network.construct_from_dict(config.typed_value("network"))
-#     session.run(tf.global_variables_initializer())
-#     out = network.layers["output"].output.placeholder
-#     out2 = network.layers["0out"].output.placeholder
-#     n_batch = 1
-#     seq_len = 3
-#     feed = {network.extern_data.get_default_input_data().placeholder:
-#             numpy.array([[[0, 0], [-1, -1], [2, 2]]], dtype="float32")}
-#     assert_equal(feed[network.extern_data.get_default_input_data().placeholder].shape, (n_batch, seq_len, num_inputs))
-#     v, v2 = session.run([out, out2], feed_dict=feed)
-#     assert_equal(v.shape, (n_batch, seq_len, num_inputs))
-#     assert_equal(v.tolist(), [[[0, 0], [0, 0], [2, 2]]])
+def test_masked_tm_net(n_time=5, n_batch=4, n_feature=1):
+  vocab_path = "/tmp/vocab.pkl"
+  vocab = _construct_vocab(n_time*n_batch + (n_time+3) * n_batch, vocab_path)
+  config = Config()
+  config.update({
+    "num_inputs": n_feature,
+    "num_outputs": {"data": [n_feature, 1], "classes": [n_feature, 1],
+                    "data_dense": [n_feature, 2], "classes_dense": [n_feature, 2]},
+    "network": {
+      "padding": {"class": "generate_padding_to_match_seq", "from": ["data:classes", "data"]},
+      "padding_dense": {"class": "generate_padding_to_match_seq", "from": ["data:classes_dense", "data:data_dense"]},
+
+      "src_mask": {"class": "probabilistic_mask", "from": ["data"], "vocab": vocab_path},
+      "trg_mask": {"class": "probabilistic_mask", "from": ["data:classes"], "vocab": vocab_path},
+      "pad_mask": {"class": "probabilistic_mask", "from": ["padding"], "vocab": vocab_path},
+
+      "un_masked_seq": {"class": "concat_sequences", "from": ["data:data_dense", "data:classes_dense", "padding_dense"]},
+      "masked_seq": {"class": "concat_sequences", "from": ["src_mask", "trg_mask", "pad_mask"]},
+      "labels": {"class": "concat_sequences",
+                 "from": ["src_mask/labels", "trg_mask/labels", "pad_mask/labels"],
+                 "is_output_layer": True},
+      "src_lengths": {"class": "length", "from": ["data:data"], "add_time_axis": True},
+      "trg_lengths": {"class": "length", "from": ["data:classes"], "add_time_axis": True},
+      "trg_positions": {"class": "combine", "kind":"add", "from": ["trg_mask/positions", "src_lengths"]},
+      "pad_positions": {"class": "combine", "kind":"add", "from": ["pad_mask/positions", "src_lengths", "trg_lengths"]},
+      "positions": {"class": "concat_sequences",
+                    "from": ["src_mask/positions", "trg_positions", "pad_positions"],
+                    "is_output_layer": True},
+
+      "gather": {"class": "gather_positions", "from": ["un_masked_seq", "positions"], "is_output_layer": True},
+    }
+  })
+  print("Creating network...")
+  network = TFNetwork(config=config, train_flag=True)
+  network.construct_from_dict(config.typed_dict["network"])
+  src_sparse = numpy.reshape(numpy.arange(n_batch * n_time, dtype=numpy.int32), (n_batch, n_time))
+  trg_sparse = numpy.reshape(numpy.arange(n_batch * (n_time + 3), dtype=numpy.int32) + (n_batch * n_time),
+                             (n_batch, (n_time + 3)))
+  src = numpy.reshape(numpy.arange(n_batch * n_time * n_feature, dtype=numpy.int32), (n_batch, n_time, n_feature))
+  trg = numpy.reshape(numpy.arange(n_batch * (n_time + 3) * n_feature, dtype=numpy.int32) + (
+    n_batch * n_time * n_feature), (n_batch, (n_time + 3), n_feature))
+  feed_dict = {
+    network.extern_data.data["data"].placeholder: src_sparse,
+    network.extern_data.data["data"].size_placeholder[0]: numpy.array([n_time] * n_batch),
+    network.extern_data.data["classes"].placeholder: trg_sparse,
+    network.extern_data.data["classes"].size_placeholder[0]: numpy.array([n_time + 3] * n_batch),
+    network.extern_data.data["data_dense"].placeholder: src,
+    network.extern_data.data["data_dense"].size_placeholder[0]: numpy.array([n_time] * n_batch),
+    network.extern_data.data["classes_dense"].placeholder: trg,
+    network.extern_data.data["classes_dense"].size_placeholder[0]: numpy.array([n_time + 3] * n_batch),
+  }
+  labels = network.layers["labels"].output.placeholder
+  positions = network.layers["positions"].output.placeholder
+  un_masked_seq = network.layers["un_masked_seq"].output.placeholder
+  out = network.layers["gather"].output.placeholder
+  out_lens = network.layers["gather"].output.get_sequence_lengths()
+  print("Creating session...")
+  with tf.Session() as session:
+    print("Init params...")
+    network.initialize_params(session=session)
+    print("Testing prob. mask layer + gather positions ...")
+    labels_res, positions_res, un_masked_seq_res, out_res, out_lens_res = session.run([labels, positions, un_masked_seq, out, out_lens], feed_dict=feed_dict)
+    # check the results:
+    print("Check if we recovered the labels correctly:", end=" ")
+    for i in range(out_res.shape[0]):
+      for j in range(out_lens_res[i]):
+        assert numpy.alltrue(out_res[i,j] == labels_res[i,j]), \
+            "Position (%s,%s) not gathered correctly! %r =/= %r" %(i,j,out_res[i,j],labels_res[i,j])
+        assert numpy.alltrue(out_res[i,j] == un_masked_seq_res[i,positions_res[i,j]]), \
+              "Position (%s,%s) not gathered correctly! %r =/= %r" %(i,j,out_res[i,j],src[i,positions_res[i,j]])
+    print(u'\N{check mark}')
 
 
 if __name__ == "__main__":

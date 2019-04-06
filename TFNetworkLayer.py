@@ -7500,7 +7500,7 @@ class ProbabilisticMaskLayer(LayerBase):
     masked_seqs = masked_seqs_array.stack()
     labels = TFUtil.merge_tensor_array_with_padding(labels_array, num_positions, list(seqs.shape[2:]))
     positions = TFUtil.merge_tensor_array_with_padding(positions_array, num_positions, [])
-
+    positions = tf.expand_dims(positions,-1)  # to fit in non-sparse shape
 
     return (masked_seqs,  # masked tokens presented as input
             labels,  # correct ('unmasked') labels for those positions
@@ -7510,17 +7510,14 @@ class ProbabilisticMaskLayer(LayerBase):
 
   @classmethod
   def get_out_data_from_opts(cls, sources, name, output_name="", *args, **kwargs):
-    shape = sources[0].output.shape
-    if shape == ():
-      shape = (None,)
     data = Data(
       name=name,
-      shape=[shape[0],1] if output_name == "positions" else shape,
+      shape=(None,1) if output_name == "positions" else sources[0].output.shape,
       dim=1 if output_name == "positions" else sources[0].output.dim,
-      sparse=False if output_name == "positions" else True,
-      batch_dim_axis=sources[0].output.batch_dim_axis,
-      time_dim_axis=sources[0].output.time_dim_axis,
-      feature_dim_axis=sources[0].output.feature_dim_axis_or_unspecified,
+      sparse=False if output_name == "positions" else sources[0].output.sparse,
+      batch_dim_axis=0,
+      time_dim_axis=1,
+      feature_dim_axis=-1 if output_name == "positions" else sources[0].output.feature_dim_axis_or_unspecified,
       dtype="int32" if output_name == "positions" else sources[0].output.dtype,
       beam_size=sources[0].output.beam_size)
     return data
@@ -7621,15 +7618,17 @@ class GeneratePaddingToMatchSeq(LayerBase):
     :param kwargs:
     """
     super(GeneratePaddingToMatchSeq, self).__init__(*args, **kwargs)
-    if max_seq_length is None:
-      import sys
-      max_seq_length = sys.maxint
     lengths_input = self.sources[0].output.get_sequence_lengths()
     lengths_to_match = self.sources[1].output.get_sequence_lengths()
-    to_match = self.sources[1].output
-    pad_lengths = tf.maximum(tf.minimum(max_seq_length, lengths_to_match * length_factor) - lengths_input, tf.constant(1))
-    pad = tf.ones([to_match.shape[0], tf.Dimension(length_factor) * to_match.shape[1]] + list(to_match.shape[2:]),
-                  dtype=to_match.dtype) * pad_value
+    to_match = self.sources[1].output.get_placeholder_as_batch_major()
+    pad_to_lengths = lengths_to_match * length_factor
+    if max_seq_length is not None:
+      pad_to_lengths = tf.minimum(max_seq_length, pad_to_lengths)
+    pad_lengths = tf.maximum(pad_to_lengths - lengths_input, tf.constant(1))
+    pad_shape = tf.concat([tf.stack([tf.shape(to_match)[0], tf.reduce_max(pad_lengths)]),
+                           tf.shape(to_match)[2:]],
+                          axis=0)
+    pad = tf.ones(pad_shape, dtype=to_match.dtype) * pad_value
 
     self.output.placeholder = pad
     self.output.size_placeholder = self.sources[0].output.size_placeholder.copy()
@@ -7641,7 +7640,7 @@ class GeneratePaddingToMatchSeq(LayerBase):
       name=name,
       shape=sources[0].output.shape,
       dim=sources[0].output.dim,
-      sparse=sources[0].sparse,
+      sparse=sources[0].output.sparse,
       batch_dim_axis=sources[0].output.batch_dim_axis,
       time_dim_axis=sources[0].output.time_dim_axis,
       feature_dim_axis=sources[0].output.feature_dim_axis_or_unspecified,
@@ -7653,7 +7652,7 @@ class ConcatSequencesLayer(LayerBase):
   """
   This layer concatenates given inputs in sources along the time axis,
   while considering the individual sequence lengths and padding.
-  Optionally an offset (+ seq_length(sources[i]) for sources[i+1]) will be applied.
+  Optionally an offset (+ seq_length(sources[:i]) for sources[i+1]) will be applied.
   """
   layer_class = "concat_sequences"
 
@@ -7669,7 +7668,8 @@ class ConcatSequencesLayer(LayerBase):
     """
     super(ConcatSequencesLayer, self).__init__(*args, **kwargs)
     batch_size = self.sources[0].output.get_batch_dim()
-    combined_seqs_array = tf.TensorArray(dtype=tf.int32, size=batch_size, dynamic_size=False, infer_shape=False)
+    combined_seqs_array = tf.TensorArray(dtype=self.sources[0].output.dtype, size=batch_size, dynamic_size=False, infer_shape=False)
+    feature_dims =[self.sources[0].output.shape[ax] for ax in self.sources[0].output.get_feature_axes()]
     i = tf.constant(0)
 
     def while_condition(i, combined_seqs_array):
@@ -7679,7 +7679,7 @@ class ConcatSequencesLayer(LayerBase):
       seqs_to_combine = []
       for j in range(len(self.sources)):
         length_ji = self.sources[j].output.get_sequence_lengths()[i]
-        seq_ji = self.sources[j].output[i][:length_ji]
+        seq_ji = self.sources[j].output.get_placeholder_as_batch_major()[i][:length_ji]
         if add_offset:
           for k in range(j):
             seq_ji += self.sources[k].output.get_sequence_lengths()[i]
@@ -7691,10 +7691,10 @@ class ConcatSequencesLayer(LayerBase):
                                          [i, combined_seqs_array],
                                          back_prop=False)
 
-    combined_lengths = tf.const(0)
+    combined_lengths = tf.constant(0)
     for j in range(len(self.sources)):
-      combined_lengths = tf.add(self.sources[j].output.get_sequence_lengths())
-    combined_seqs = TFUtil.merge_tensor_array_with_padding(combined_seqs_array, combined_lengths, list(self.sources[0].output.shape[2:]))
+      combined_lengths = tf.add(combined_lengths, self.sources[j].output.get_sequence_lengths())
+    combined_seqs = TFUtil.merge_tensor_array_with_padding(combined_seqs_array, combined_lengths, feature_dims)
 
     self.output.placeholder = combined_seqs
     self.output.size_placeholder = self.sources[0].output.size_placeholder.copy()
@@ -7706,7 +7706,7 @@ class ConcatSequencesLayer(LayerBase):
       name=name,
       shape=sources[0].output.shape,
       dim=sources[0].output.dim,
-      sparse=sources[0].sparse,
+      sparse=sources[0].output.sparse,
       batch_dim_axis=sources[0].output.batch_dim_axis,
       time_dim_axis=sources[0].output.time_dim_axis,
       feature_dim_axis=sources[0].output.feature_dim_axis_or_unspecified,

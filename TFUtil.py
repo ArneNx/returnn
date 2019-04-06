@@ -7469,7 +7469,7 @@ def merge_tensor_array_with_padding(arr, row_lengths, feature_dims):
   def body(i, arr_pad):
     # copy arr[i] into first positions of a row filled with 0:
     non_pad_pos = tf.expand_dims(tf.range(row_lengths[i]), -1)
-    arr_i_padded = tf.scatter_nd(non_pad_pos,arr.read(i),[pad_to_length]+feature_dims)
+    arr_i_padded = tf.scatter_nd(non_pad_pos, arr.read(i), [pad_to_length] + feature_dims)
     arr_pad = arr_pad.write(i, arr_i_padded)
     return [tf.add(i, 1), arr_pad]
 
