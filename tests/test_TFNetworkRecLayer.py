@@ -3657,6 +3657,148 @@ def test_OptimalCompletionsLayer():
     assert out[0, 3] == 0 and all(out[0, :3] == 1) and all(out[0, 4:] == 1)
 
 
+
+def test_my_subnetwork2():
+  numpy.set_printoptions(precision=15)
+  with make_scope() as session:
+    config = Config()
+    n_in, n_hidden, n_out = 2, 6, 3
+    config.update({
+        "num_outputs": n_out,
+        "num_inputs": n_in,
+      "network": {
+        # "output": {
+        #   "class": "rec",
+        #   "optimize_move_layers_out": False,  # We esp. want to test it perform a single step, for debugging.
+        #   "unit": {
+                "input": {"class": "linear", "n_out": n_hidden, "activation": "identity",
+                            "from": ["data"]
+                            },
+                  'enc_01_self_att_att': {'attention_dropout': 0.2,
+                                          'attention_left_only': True,
+                                          'class': 'self_attention',
+                                          'forward_weights_init': "variance_scaling_initializer(mode='fan_in', distribution='uniform', scale=1.0)",
+                                          'from': ['input'],
+                                          'n_out': n_hidden,
+                                          'num_heads': 2,
+                                          'total_key_dim': n_hidden},
+                  "output": {"class": "linear", "activation": "identity",
+                             "n_out": n_out, "from": ["enc_01_self_att_att"]},
+        #   },
+        #   "n_out": n_out},
+        }
+      })
+    print("Creating network...")
+    network = TFNetwork(config=config, train_flag=True)
+    network.construct_from_dict(config.typed_dict["network"])
+    network.initialize_params(session)
+    input_np = [
+        [[0.7, 0.1], [-0.3, -0.1], [0.2, -0.1]],
+      [[1.0, -0.4], [-0.2, 0.3], [0.0, 0.0]]]
+    input_np = numpy.array(input_np, dtype="float32")
+    input_seq_lens = [3, 2]
+    n_batch = len(input_seq_lens)
+    assert_equal(input_np.shape, (n_batch, max(input_seq_lens), n_in))
+    # Now also forward, and compare with previous.
+    input_placeholder = network.extern_data.data["data"].placeholder
+    input_seq_lens_placeholder = network.extern_data.data["data"].size_placeholder[0]
+    output_layer = network.get_default_output_layer(must_exist=True)
+    output_np, output_seq_lens = session.run(
+      (output_layer.output.get_placeholder_as_batch_major(), output_layer.output.get_sequence_lengths()),
+      feed_dict={input_placeholder: input_np, input_seq_lens_placeholder: input_seq_lens})
+    assert_equal(list(output_seq_lens), input_seq_lens)
+    assert_equal(output_np.shape, (n_batch, max(input_seq_lens), n_out))
+    for t in range(max(output_seq_lens)):
+      for b in range(n_batch):
+        if t >= output_seq_lens[b]:
+          output_np[b, t] = 0.0
+    print("LSTM rec subnet, output:")
+    print(output_np)
+
+
+def test_my_subnetwork():
+  numpy.set_printoptions(precision=15)
+  with make_scope() as session:
+    config = Config()
+    n_in, n_hidden, n_out = 2, 6, 3
+    config.update({
+        "num_outputs": n_out,
+        "num_inputs": n_in,
+        "log_verbosity": 5,
+      # "debug_print_layer_output_template": True,
+      # "debug_print_layer_output_shape": True,
+      # "debug_grad_summaries": True,
+      # "debug_save_updater_vars": True,
+      # "debug_add_check_numerics_ops": True,
+        "network": {
+          "expanded_input": {
+            "class":"expand_dims",
+            "axis": 1,
+            "from": ["data"],
+            "dim": None,
+            "spatial": True
+          },
+          "iteration": {
+            "class": "rec",
+            "optimize_move_layers_out": False,  # We esp. want to test it perform a single step, for debugging.
+            "from": ["expanded_input"],
+            "unroll": True, #TODO: try without this
+            "max_seq_len": 1, #TODO: try without this
+            "unit": {
+                  "input": {"class": "linear", "n_out": n_hidden, "activation": "identity",
+                            "from": ["data:source"]
+                            # "forward_weights_init": "random_normal_initializer(mean=0.0, stddev=1.0)"
+                            },
+                  'enc_01_self_att_att': {'attention_dropout': 0.2,
+                                          'attention_left_only': True,
+                                          'class': 'self_attention',
+                                          'forward_weights_init': "variance_scaling_initializer(mode='fan_in', distribution='uniform', scale=1.0)",
+                                          'from': ['input'],
+                                          'n_out': n_hidden,
+                                          'num_heads': 2,
+                                          'total_key_dim': n_hidden},
+                  "output": {"class": "linear", "activation": "identity",
+                             # "forward_weights_init": "random_normal_initializer(mean=0.0, stddev=1.0)",
+                             # "bias_init": "random_normal_initializer(mean=0.0, stddev=0.1)",
+                             "n_out": n_out, "from": ["enc_01_self_att_att"]},
+            },
+            "n_out": n_out},
+          "output": {
+            "class": "merge_dims",
+            "axes": (0,1),
+            "from": ["iteration"]
+          },
+        }
+      })
+    print("Creating network...")
+    network = TFNetwork(config=config, train_flag=True)
+    network.construct_from_dict(config.typed_dict["network"])
+    network.initialize_params(session)
+    input_np = [
+        [[0.7, 0.1], [-0.3, -0.1], [0.2, -0.1]],
+      [[1.0, -0.4], [-0.2, 0.3], [0.0, 0.0]]]
+    input_np = numpy.array(input_np, dtype="float32")
+    input_seq_lens = [3, 2]
+    n_batch = len(input_seq_lens)
+    assert_equal(input_np.shape, (n_batch, max(input_seq_lens), n_in))
+    # Now also forward, and compare with previous.
+    input_placeholder = network.extern_data.data["data"].placeholder
+    input_seq_lens_placeholder = network.extern_data.data["data"].size_placeholder[0]
+    output_layer = network.get_default_output_layer(must_exist=True)
+    output_np, output_seq_lens = session.run(
+      (output_layer.output.get_placeholder_as_batch_major(), output_layer.output.get_sequence_lengths()),
+      feed_dict={input_placeholder: input_np, input_seq_lens_placeholder: input_seq_lens})
+    assert_equal(list(output_seq_lens), input_seq_lens)
+    assert_equal(output_np.shape, (n_batch, max(input_seq_lens), n_out))
+    for t in range(max(output_seq_lens)):
+      for b in range(n_batch):
+        if t >= output_seq_lens[b]:
+          output_np[b, t] = 0.0
+    print("LSTM rec subnet, output:")
+    print(output_np)
+
+
+
 if __name__ == "__main__":
   try:
     better_exchook.install()

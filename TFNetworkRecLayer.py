@@ -1,8 +1,11 @@
 from __future__ import print_function
 
+from copy import copy
+
 import tensorflow as tf
 from tensorflow.python.ops.nn import rnn_cell
-from TFNetworkLayer import LayerBase, _ConcatInputLayer, SearchChoices, get_concat_sources_data_template, Loss
+from TFNetworkLayer import LayerBase, _ConcatInputLayer, SearchChoices, get_concat_sources_data_template, Loss, \
+  SubnetworkLayer
 from TFUtil import Data, reuse_name_scope, get_random_seed
 from Util import NotSpecified
 from Log import log
@@ -1196,7 +1199,7 @@ class _SubnetworkRecCell(object):
     output_template = self.layer_data_templates["output"]
     assert output_template.output.dim == self.parent_rec_layer.output.dim
     assert self.parent_rec_layer.output.time_dim_axis == 0
-    assert output_template.output.time_dim_axis is None
+    # assert output_template.output.time_dim_axis is None
     assert output_template.output.batch_shape == self.parent_rec_layer.output.batch_shape[1:], (
       "see RecLayer.get_out_data_from_opts()")
 
@@ -4105,29 +4108,30 @@ class SelfAttentionLayer(_ConcatInputLayer):
     assert total_key_dim % num_heads == 0, "must be divisible"
     assert total_value_dim % num_heads == 0, "must be divisible. total_value_dim = n_out"
     from TFUtil import get_initializer, dot, get_shape, to_int32_64
-    with self.var_creation_scope():
-      fwd_weights_initializer = get_initializer(
-        forward_weights_init, seed=self.network.random.randint(2 ** 31), eval_local_ns={"layer": self})
-      n_in = self.input_data.dim
-      mat_n_out = total_key_dim * 2 + total_value_dim  # Q, K, V
-      mat = self.add_param(tf.get_variable(
-        name="QKV", shape=(n_in, mat_n_out), dtype=tf.float32, initializer=fwd_weights_initializer),
-        axes_split_info=[[n_in], [total_key_dim, total_key_dim, total_value_dim]])
-      if self._rec_previous_layer:
-        assert self.input_data.time_dim_axis is None
-        assert attention_left_only
-        # (batch,heads,time,kv-dim//heads)
-        prev_kv_left = self._rec_previous_layer.rec_vars_outputs["kv_left"]
-      else:
-        assert self.input_data.time_dim_axis is not None
-        batch_dim = self.input_data.get_batch_dim()
-        prev_kv_left = (
-          RnnCellLayer.get_rec_initial_state_inner(
-            initial_state=initial_state, name=self.name, rec_layer=self,
-            state_key="kv_left",
-            initial_shape=(batch_dim, num_heads, 0, (total_key_dim + total_value_dim) // num_heads),
-            shape_invariant=(None, num_heads, None, (total_key_dim + total_value_dim) // num_heads))
-          if initial_state is not None else None)
+    # with self.var_creation_scope():
+    fwd_weights_initializer = get_initializer(
+      forward_weights_init, seed=self.network.random.randint(2 ** 31), eval_local_ns={"layer": self})
+    n_in = self.input_data.dim
+    mat_n_out = total_key_dim * 2 + total_value_dim  # Q, K, V
+    mat = self.add_param(tf.get_variable(
+      name="QKV", shape=(n_in, mat_n_out), dtype=tf.float32, initializer=fwd_weights_initializer),
+      axes_split_info=[[n_in], [total_key_dim, total_key_dim, total_value_dim]])
+    if self._rec_previous_layer:
+      assert self.input_data.time_dim_axis is None
+      assert attention_left_only
+      # (batch,heads,time,kv-dim//heads)
+      prev_kv_left = self._rec_previous_layer.rec_vars_outputs["kv_left"]
+    else:
+      assert self.input_data.time_dim_axis is not None
+      batch_dim = self.input_data.get_batch_dim()
+      prev_kv_left = (
+        RnnCellLayer.get_rec_initial_state_inner(
+          initial_state=initial_state, name=self.name, rec_layer=self,
+          state_key="kv_left",
+          initial_shape=(batch_dim, num_heads, 0, (total_key_dim + total_value_dim) // num_heads),
+          shape_invariant=(None, num_heads, None, (total_key_dim + total_value_dim) // num_heads))
+        if initial_state is not None else None)
+    ###############
     x = self.input_data.placeholder
     if self.input_data.sparse:
       x = tf.nn.embedding_lookup(mat, to_int32_64(x))
