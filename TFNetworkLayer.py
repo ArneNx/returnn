@@ -3097,7 +3097,7 @@ class ExpandDimsLayer(_ConcatInputLayer):
   """
   layer_class = "expand_dims"
 
-  def __init__(self, axis, dim=1, **kwargs):
+  def __init__(self, axis, dim=1, spatial=False, **kwargs):
     """
     :param str|int axis: axis to add, e.g. "F"|"feature" or "spatial"|"time"|"T".
       if this is an integer, the input data is first converted into batch-major mode,
@@ -3114,6 +3114,8 @@ class ExpandDimsLayer(_ConcatInputLayer):
     self.output.size_placeholder = {
       (i if (data.get_batch_axis(i) < axis) else i + 1): v
       for (i, v) in data.size_placeholder.items()}
+    if spatial:
+      self.output.size_placeholder[axis-1] = tf.ones([data.get_batch_dim()],dtype=tf.int32)
 
   @classmethod
   def _get_axis(cls, data, axis):
