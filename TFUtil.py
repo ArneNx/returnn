@@ -975,6 +975,11 @@ class Data(object):
     kwargs["shape"] = new_shape
     if name:
       kwargs["name"] = name
+    kwargs["size_placeholder"] = {}
+    for axis, size in self.size_placeholder.items():
+      if axis == self.time_dim_axis_excluding_batch:
+        continue
+      kwargs["size_placeholder"][axis if (axis < self.time_dim_axis) else (axis - 1)] = size
     return Data(**kwargs)
 
   def copy_template_adding_time_dim(self, name=None, time_dim_axis=0):
