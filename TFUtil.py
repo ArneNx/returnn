@@ -3280,7 +3280,7 @@ def expand_dims_unbroadcast(x, axis, dim, name="expand_dims_unbroadcast"):
   with tf.name_scope(name):
     x = tf.convert_to_tensor(x)
     x = tf.expand_dims(x, axis)
-    if dim is not 1:
+    if dim is not 1 and dim is not None:
       new_ndim = x.get_shape().ndims
       assert new_ndim is not None, "not implemented otherwise yet"
       assert isinstance(axis, int), "not implemented otherwise yet"
