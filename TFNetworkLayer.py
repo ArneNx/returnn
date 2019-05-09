@@ -7375,15 +7375,16 @@ class ProbabilisticMaskLayer(LayerBase):
         param_vector.append(1 - (s.get("mask_m_prob",mask_m_prob) + s.get("mask_r_prob",mask_r_prob)))
         params.append(param_vector)
       params_matrix = tf.constant(params)
-      selected = tf.random_uniform([], 0, params_matrix.shape[0], seed=self.random_seed, dtype=tf.int32)
+      selected = tf.cond(self.network.train_flag,
+                         lambda: tf.random_uniform([], 0, params_matrix.shape[0], seed=self.random_seed, dtype=tf.int32,),
+                         lambda: tf.constant(0))
       params = params_matrix[selected]
       self.mask_factor = params[0]
-      self.mask_prob  = params[1]
+      self.mask_prob = params[1]
       self.mask_m_prob = params[2]
       self.mask_r_prob = params[3]
       self.mask_k_prob = params[4]
     else:
-      params_matrix = None
       self.mask_factor = tf.constant(mask_factor)
       self.mask_prob = tf.constant(mask_prob)
       self.mask_m_prob = tf.constant(mask_m_prob)
@@ -7402,10 +7403,10 @@ class ProbabilisticMaskLayer(LayerBase):
     seq_mask = self.sources[1].output.get_placeholder_as_batch_major() if len(self.sources) > 1 else None
     if isinstance(mask_factor, (list,tuple)):
       # if this a tuple -> factor is selected uniformly at random from range [mask_factor[0],mask_factor[1])
-      mask_prob = self.mask_prob * tf.random_uniform([], mask_factor[0], mask_factor[1], seed=self.random_seed)
-    else:
-      #   if this is a scalar -> multiply with self.mask_prob
-      mask_prob = self.mask_prob * self.mask_factor
+      self.mask_factor = tf.cond(self.network.train_flag,
+                            lambda: tf.random_uniform([], mask_factor[0], mask_factor[1], seed=self.random_seed),
+                            lambda: mask_factor[1])
+    mask_prob = self.mask_prob * self.mask_factor
 
     masked_sequence, labels, positions, num_positions = self._mask_seq(seqs, mask_prob, seq_lengths, seq_mask)
     self.output_dict = {
