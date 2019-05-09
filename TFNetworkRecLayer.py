@@ -4108,14 +4108,14 @@ class SelfAttentionLayer(_ConcatInputLayer):
     assert total_key_dim % num_heads == 0, "must be divisible"
     assert total_value_dim % num_heads == 0, "must be divisible. total_value_dim = n_out"
     from TFUtil import get_initializer, dot, get_shape, to_int32_64
-    # with self.var_creation_scope():
-    fwd_weights_initializer = get_initializer(
-      forward_weights_init, seed=self.network.random.randint(2 ** 31), eval_local_ns={"layer": self})
-    n_in = self.input_data.dim
-    mat_n_out = total_key_dim * 2 + total_value_dim  # Q, K, V
-    mat = self.add_param(tf.get_variable(
-      name="QKV", shape=(n_in, mat_n_out), dtype=tf.float32, initializer=fwd_weights_initializer),
-      axes_split_info=[[n_in], [total_key_dim, total_key_dim, total_value_dim]])
+    with self.var_creation_scope():
+      fwd_weights_initializer = get_initializer(
+        forward_weights_init, seed=self.network.random.randint(2 ** 31), eval_local_ns={"layer": self})
+      n_in = self.input_data.dim
+      mat_n_out = total_key_dim * 2 + total_value_dim  # Q, K, V
+      mat = self.add_param(tf.get_variable(
+        name="QKV", shape=(n_in, mat_n_out), dtype=tf.float32, initializer=fwd_weights_initializer),
+        axes_split_info=[[n_in], [total_key_dim, total_key_dim, total_value_dim]])
     if self._rec_previous_layer:
       assert self.input_data.time_dim_axis is None
       assert attention_left_only
