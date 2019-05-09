@@ -7335,7 +7335,7 @@ class ProbabilisticMaskLayer(LayerBase):
                mask_m_prob=0.8,
                mask_r_prob=0.1,
                random_seed=42,
-               fixed_seq_mask=None,
+               param_sets=None,
                *args,
                **kwargs):
     """
@@ -7343,22 +7343,13 @@ class ProbabilisticMaskLayer(LayerBase):
     :param str vocab: path to vocabulary dict in form {"word": idx}
     :param str|None vocab_probs: path to dictionary containing probabilities to mask
     each individual token in a sequence in form {"word": prob}
-    :param str seq_end_symbol: token to end each sequence
     :param str mask_symbol: token to mask with
-    :param str separator_symbol: token to separate seqs and target sequence (if target sequence is given)
-    :param int max_seq_len: positive integer to set an upper bound on the length of a sequence (seqs/trg individually)
     :param float mask_prob: float in range (0,1) to specify probability for each token in the sequence to be masked
-    :param float|tuple[float] mask_src_factor: mask_prob for the source sequence is mask_src_factor * mask_prob
-    if mask_src_factor is a tuple, mask_src_factor=uniform_random(mask_src_factor[0],mask_src_factor[1]) for each seq
-    :param float|tuple[float] mask_trg_factor: mask_prob for the target sequence is mask_tar_factor * mask_prob
-    if mask_tar_factor is a tuple, mask_tar_factor=uniform_random(mask_tar_factor[0],mask_tar_factor[1]) for each seq
-    :param float|tuple[float] mask_pad_factor: mask_prob for the padding of the source sequence is mask_pad_factor * mask_prob
-    if mask_pad_factor is a tuple, mask_pad_factor=uniform_random(mask_pad_factor[0],mask_pad_factor[1]) for each seq
+    :param float|tuple[float] mask_factor: mask_prob for the source sequence is mask_factor * mask_prob
+    if mask_factor is a tuple, mask_factor=uniform_random(mask_factor[0],mask_factor[1]) for each seq
     :param float mask_m_prob: probability that a selected position is replaced by mask token
     :param float mask_r_prob: probability that a selected position is replaced by random token from vocab
     :param LayerBase|None fixed_seq_mask: mask in form of a tensor of seqs length
-    containing 0/1/2/-1 (mask/random/keep/no-mask) for each position
-    :param LayerBase|None fixed_trg_mask: mask in form of a tensor of trg length
     containing 0/1/2/-1 (mask/random/keep/no-mask) for each position
     :param args:
     :param kwargs:
@@ -7373,10 +7364,31 @@ class ProbabilisticMaskLayer(LayerBase):
     """
     super(ProbabilisticMaskLayer, self).__init__(*args, **kwargs)
     self.random_seed = random_seed
-    self.mask_prob = mask_prob
-    self.mask_m_prob = mask_m_prob
-    self.mask_r_prob = mask_r_prob
-    self.mask_k_prob = 1 - (mask_m_prob + mask_r_prob)
+    if param_sets:
+      params = []
+      for s in param_sets:
+        param_vector = []
+        param_vector.append(s.get("mask_factor",mask_factor))
+        param_vector.append(s.get("mask_prob",mask_prob))
+        param_vector.append(s.get("mask_m_prob",mask_m_prob))
+        param_vector.append(s.get("mask_r_prob",mask_r_prob))
+        param_vector.append(1 - (s.get("mask_m_prob",mask_m_prob) + s.get("mask_r_prob",mask_r_prob)))
+        params.append(param_vector)
+      params_matrix = tf.constant(params)
+      selected = tf.random_uniform([], 0, params_matrix.shape[0], seed=self.random_seed, dtype=tf.int32)
+      params = params_matrix[selected]
+      self.mask_factor = params[0]
+      self.mask_prob  = params[1]
+      self.mask_m_prob = params[2]
+      self.mask_r_prob = params[3]
+      self.mask_k_prob = params[4]
+    else:
+      params_matrix = None
+      self.mask_factor = tf.constant(mask_factor)
+      self.mask_prob = tf.constant(mask_prob)
+      self.mask_m_prob = tf.constant(mask_m_prob)
+      self.mask_r_prob = tf.constant(mask_r_prob)
+      self.mask_k_prob = tf.constant(1 - (mask_m_prob + mask_r_prob))
 
     source_data = self.sources[0].output
 
@@ -7387,13 +7399,13 @@ class ProbabilisticMaskLayer(LayerBase):
 
     seqs = source_data.get_placeholder_as_batch_major()
     seq_lengths = source_data.get_sequence_lengths()
-    seq_mask = fixed_seq_mask.output.get_placeholder_as_batch_major() if fixed_seq_mask else None
-    if isinstance(mask_factor, tuple):
+    seq_mask = self.sources[1].output.get_placeholder_as_batch_major() if len(self.sources) > 1 else None
+    if isinstance(mask_factor, (list,tuple)):
       # if this a tuple -> factor is selected uniformly at random from range [mask_factor[0],mask_factor[1])
-      mask_prob = tf.constant(mask_prob) * tf.random_uniform([], mask_factor[0], mask_factor[1], seed=self.random_seed)
+      mask_prob = self.mask_prob * tf.random_uniform([], mask_factor[0], mask_factor[1], seed=self.random_seed)
     else:
       #   if this is a scalar -> multiply with self.mask_prob
-      mask_prob = tf.constant(mask_prob) * tf.constant(mask_factor)
+      mask_prob = self.mask_prob * self.mask_factor
 
     masked_sequence, labels, positions, num_positions = self._mask_seq(seqs, mask_prob, seq_lengths, seq_mask)
     self.output_dict = {
@@ -7445,7 +7457,8 @@ class ProbabilisticMaskLayer(LayerBase):
         num_to_predict = tf.shape(selected_indices)[0]
         choice = tf.gather(fixed_mask_i, selected_indices)
       else:
-        num_to_predict = tf.maximum(tf.constant(1),
+        min_predictions = tf.cond(mask_prob > 0.0, lambda: tf.constant(1, dtype=tf.int32), lambda: tf.constant(0, dtype=tf.int32))
+        num_to_predict = tf.maximum(min_predictions,
                                   tf.cast(tf.round(tf.to_float(seq_lens[i]) * mask_prob), dtype=tf.int32))
         if self.vocab_probs is None:
           # select num_to_predict positions uniformly at random:
@@ -7458,8 +7471,9 @@ class ProbabilisticMaskLayer(LayerBase):
           logits = tf.log(probs / tf.reduce_sum(probs))
           selected_indices = TFUtil.sample_without_replacement(logits, num_to_predict, seed=self.random_seed)
 
+        selected_indices = -1 * tf.nn.top_k(-1 * selected_indices, k=num_to_predict)[0]  # to have labels in correct order TODO: disable this for training
         # now calculate what to replace the selected positions with:
-        logits = tf.log(tf.constant([[self.mask_m_prob, self.mask_r_prob, self.mask_k_prob]]))
+        logits = tf.log([[self.mask_m_prob, self.mask_r_prob, self.mask_k_prob]])
         # generate random choices for: 0 = mask, 1 = rnd replace, 2 = keep
         choice = tf.multinomial(logits, num_to_predict, output_dtype=tf.int32, seed=self.random_seed)
 
