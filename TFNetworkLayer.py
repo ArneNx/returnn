@@ -7668,7 +7668,7 @@ class GeneratePaddingToMatchSeq(LayerBase):
   """
   layer_class = "generate_padding_to_match_seq"
 
-  def __init__(self, length_factor=3, max_seq_length=None, pad_value=0, *args, **kwargs):
+  def __init__(self, length_factor=3, max_seq_length=None, pad_value=0, randomize=False, *args, **kwargs):
     """
     :param length_factor:
     :param max_seq_length:
@@ -7679,7 +7679,14 @@ class GeneratePaddingToMatchSeq(LayerBase):
     lengths_input = self.sources[0].output.get_sequence_lengths()
     lengths_to_match = self.sources[1].output.get_sequence_lengths()
     to_match = self.sources[1].output.get_placeholder_as_batch_major()
-    pad_to_lengths = lengths_to_match * length_factor
+    if randomize:
+      pad_to_lengths = tf.cond(self.network.train_flag,
+                               lambda :tf.cast(tf.cast(lengths_to_match, dtype=tf.float32) *
+                                                tf.random_uniform(shape=tf.shape(lengths_to_match),
+                                                 minval=1.0, maxval=length_factor, dtype=tf.float32), dtype=tf.int32),
+                               lambda :tf.cast(tf.cast(lengths_to_match, dtype=tf.float32) * length_factor, dtype=tf.int32))
+    else:
+      pad_to_lengths = lengths_to_match * length_factor
     if max_seq_length is not None:
       pad_to_lengths = tf.minimum(max_seq_length, pad_to_lengths)
     pad_lengths = tf.maximum(pad_to_lengths - lengths_input, tf.constant(1))
