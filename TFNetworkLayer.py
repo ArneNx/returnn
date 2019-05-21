@@ -7334,6 +7334,8 @@ class ProbabilisticMaskLayer(LayerBase):
                mask_factor=1.0,
                mask_m_prob=0.8,
                mask_r_prob=0.1,
+               mask_d_prob=0.0,
+               mask_o_prob=0.0,
                random_seed=42,
                param_sets=None,
                *args,
@@ -7364,15 +7366,29 @@ class ProbabilisticMaskLayer(LayerBase):
     """
     super(ProbabilisticMaskLayer, self).__init__(*args, **kwargs)
     self.random_seed = random_seed
+    use_mask_factor_range = isinstance(mask_factor, (list,tuple))
     if param_sets:
       params = []
       for s in param_sets:
+        if isinstance(s.get("mask_factor",mask_factor), (list,tuple)):
+          use_mask_factor_range = True
+      for s in param_sets:
         param_vector = []
-        param_vector.append(s.get("mask_factor",mask_factor))
+        if use_mask_factor_range and isinstance(s.get("mask_factor",mask_factor), (list,tuple)):
+          param_vector.append(s.get("mask_factor",mask_factor)[0])
+        else:
+          param_vector.append(s.get("mask_factor",mask_factor))
         param_vector.append(s.get("mask_prob",mask_prob))
         param_vector.append(s.get("mask_m_prob",mask_m_prob))
         param_vector.append(s.get("mask_r_prob",mask_r_prob))
-        param_vector.append(1 - (s.get("mask_m_prob",mask_m_prob) + s.get("mask_r_prob",mask_r_prob)))
+        param_vector.append(1 - (s.get("mask_m_prob", mask_m_prob) + s.get("mask_r_prob", mask_r_prob) +
+                                 s.get("mask_d_prob",mask_d_prob) + s.get("mask_o_prob", mask_o_prob)))
+        param_vector.append(s.get("mask_d_prob",mask_d_prob))
+        param_vector.append(s.get("mask_o_prob",mask_o_prob))
+        if use_mask_factor_range and isinstance(s.get("mask_factor",mask_factor), (list,tuple)):
+          param_vector.append(s.get("mask_factor",mask_factor)[1])
+        elif use_mask_factor_range:
+          param_vector.append(s.get("mask_factor",mask_factor))  # use the same value as upper limit to fit the same pattern
         params.append(param_vector)
       params_matrix = tf.constant(params)
       selected = tf.cond(self.network.train_flag,
@@ -7384,12 +7400,22 @@ class ProbabilisticMaskLayer(LayerBase):
       self.mask_m_prob = params[2]
       self.mask_r_prob = params[3]
       self.mask_k_prob = params[4]
+      self.mask_d_prob = params[5]
+      self.mask_o_prob = params[6]
+      if use_mask_factor_range:
+        self.mask_factor_upper = params[7]
     else:
-      self.mask_factor = tf.constant(mask_factor)
+      if use_mask_factor_range:
+        self.mask_factor = tf.constant(mask_factor[0])
+        self.mask_factor_upper = tf.constant(mask_factor[1])
+      else:
+        self.mask_factor = tf.constant(mask_factor)
       self.mask_prob = tf.constant(mask_prob)
       self.mask_m_prob = tf.constant(mask_m_prob)
       self.mask_r_prob = tf.constant(mask_r_prob)
-      self.mask_k_prob = tf.constant(1 - (mask_m_prob + mask_r_prob))
+      self.mask_k_prob = tf.constant(1 - (mask_m_prob + mask_r_prob + mask_o_prob + mask_d_prob))
+      self.mask_d_prob = tf.constant(mask_d_prob)
+      self.mask_o_prob = tf.constant(mask_o_prob)
 
     source_data = self.sources[0].output
 
@@ -7401,11 +7427,12 @@ class ProbabilisticMaskLayer(LayerBase):
     seqs = source_data.get_placeholder_as_batch_major()
     seq_lengths = source_data.get_sequence_lengths()
     seq_mask = self.sources[1].output.get_placeholder_as_batch_major() if len(self.sources) > 1 else None
-    if isinstance(mask_factor, (list,tuple)):
+    if use_mask_factor_range:
       # if this a tuple -> factor is selected uniformly at random from range [mask_factor[0],mask_factor[1])
       self.mask_factor = tf.cond(self.network.train_flag,
-                            lambda: tf.random_uniform([], mask_factor[0], mask_factor[1], seed=self.random_seed),
-                            lambda: mask_factor[1])
+                            lambda: tf.random_uniform([], self.mask_factor, self.mask_factor_upper, seed=self.random_seed),
+                            lambda: self.mask_factor_upper)
+      self.mask_factor = tf.Print(self.mask_factor, [self.mask_factor, self.network.train_flag], "MASK FACTOR")
     mask_prob = self.mask_prob * self.mask_factor
 
     masked_sequence, labels, positions, num_positions = self._mask_seq(seqs, mask_prob, seq_lengths, seq_mask)
@@ -7474,8 +7501,8 @@ class ProbabilisticMaskLayer(LayerBase):
 
         selected_indices = -1 * tf.nn.top_k(-1 * selected_indices, k=num_to_predict)[0]  # to have labels in correct order TODO: disable this for training
         # now calculate what to replace the selected positions with:
-        logits = tf.log([[self.mask_m_prob, self.mask_r_prob, self.mask_k_prob]])
-        # generate random choices for: 0 = mask, 1 = rnd replace, 2 = keep
+        logits = tf.log([[self.mask_m_prob, self.mask_r_prob, self.mask_k_prob, self.mask_d_prob, self.mask_o_prob]])
+        # generate random choices for: 0 = mask, 1 = rnd replace, 2 = keep, 3=duplicate, 4=reorder
         choice = tf.multinomial(logits, num_to_predict, output_dtype=tf.int32, seed=self.random_seed)
 
       labels_i = tf.gather(seqs[i], selected_indices)  # add a label only to selected positions
@@ -7491,6 +7518,20 @@ class ProbabilisticMaskLayer(LayerBase):
       rand_vector = tf.random_uniform(shape, minval=0, maxval=self.vocab_length,
                                       dtype=seqs.dtype, seed=self.random_seed)  # replace with random vocab word
       mask_values = tf.where(tf.equal(choice, tf.constant(1)), rand_vector, mask_values)
+      # every index with 3 in choice gets replaced by right neighbor or (kept for position -1) to simulate duplicate words
+      shifted_indices = tf.minimum(selected_indices + 1, seq_lens[i]-1)
+      neighbors = tf.gather(seqs[i], shifted_indices)
+      mask_values = tf.where(tf.equal(choice, tf.constant(3)), neighbors, mask_values)
+      # every index with 4 in choice gets swapped with another word with choice 4
+      def do_reordering():
+        pos_to_shuffle = tf.boolean_mask(selected_indices, tf.equal(choice, tf.constant(4))) # select those indices with choice=4
+        shuffled_pos = tf.random_shuffle(pos_to_shuffle)
+        reordered_labels = tf.gather(seqs[i], shuffled_pos) #shuffle among those positions and select the corresponding values from seq
+        reordered = tf.scatter_nd(tf.expand_dims(pos_to_shuffle,-1), reordered_labels, tf.shape(seqs[i])) #distribute at the right (unshuffled) positions
+        reordered = tf.gather(reordered, selected_indices)
+        return reordered
+      reordered = tf.cond(tf.equal(tf.reduce_max(choice),4), do_reordering, lambda: mask_values) # for some reason the scatter_nd gives an error for empty inputs
+      mask_values = tf.where(tf.equal(choice, tf.constant(4)), reordered, mask_values)
       # every index with 2 in choice (all remaining) is kept unchanged
 
       update = tf.scatter_nd(tf.reshape(selected_indices, [-1,1]), mask_values, tf.shape(seqs[i]))
