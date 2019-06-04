@@ -7551,7 +7551,7 @@ class ProbabilisticMaskLayer(LayerBase):
                                                                                               labels_array,
                                                                                               positions_array,
                                                                                               num_positions_array],
-                                                                                             back_prop=False)
+                                                                                             back_prop=True)
 
     # merge them back together
     num_positions = num_positions_array.stack()
@@ -7754,7 +7754,7 @@ class ConcatSequencesLayer(LayerBase):
       return [tf.add(i, 1), combined_seqs_array]
     _, combined_seqs_array = tf.while_loop(while_condition, body,
                                          [i, combined_seqs_array],
-                                         back_prop=False)
+                                         back_prop=True)
 
     combined_lengths = tf.constant(0)
     for j in range(len(self.sources)):
