@@ -162,7 +162,7 @@ class LmDataset(CachedDataset2):
     if add_delayed_seq_data:
       self.num_outputs["delayed"] = self.num_outputs["data"]
       self.labels["delayed"] = self.labels["data"]
-    if not add_language_id is False:
+    if not (add_language_id is False):
       self.num_outputs["lang_id"] = [2,1]  # let's assume only two languages for now
 
     self.orths = read_corpus(corpus_file)
@@ -321,7 +321,6 @@ class LmDataset(CachedDataset2):
           ([self.orth_symbols_map[self.delayed_seq_data_start_symbol]], data[:-1])).astype(self.dtype)
         assert targets["delayed"].shape == data.shape
       self.next_seq_idx = seq_idx + 1
-
       return DatasetSeq(seq_idx=seq_idx, features=data, targets=targets, seq_tag=seq_tag)
 
 
@@ -1208,6 +1207,7 @@ class TranslationDataset(CachedDataset2):
     line_nr = self._seq_order[seq_idx]
     features = self._get_data(key=self._main_data_key, line_nr=line_nr)
     targets = self._get_data(key=self._main_classes_key, line_nr=line_nr)
+
     assert features is not None and targets is not None
     if self.add_language_id:
       features = {'data':features,
