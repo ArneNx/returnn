@@ -35,6 +35,7 @@ class LmDataset(CachedDataset2):
                error_on_invalid_seq=True,
                add_delayed_seq_data=False,
                delayed_seq_data_start_symbol="[START]",
+               add_language_id=None,
                **kwargs):
     """
     After initialization, the corpus is represented by self.orths (as a list of sequences).
@@ -73,6 +74,7 @@ class LmDataset(CachedDataset2):
 
     print("LmDataset, loading file", corpus_file, file=log.v4)
 
+    self.add_language_id = add_language_id
     self.word_based = word_based
     self.seq_end_symbol = seq_end_symbol
     self.unknown_symbol = unknown_symbol
@@ -160,6 +162,8 @@ class LmDataset(CachedDataset2):
     if add_delayed_seq_data:
       self.num_outputs["delayed"] = self.num_outputs["data"]
       self.labels["delayed"] = self.labels["data"]
+    if not add_language_id is False:
+      self.num_outputs["lang_id"] = [2,1]  # let's assume only two languages for now
 
     self.orths = read_corpus(corpus_file)
     # It's only estimated because we might filter some out or so.
@@ -304,7 +308,10 @@ class LmDataset(CachedDataset2):
       else:
         assert False
 
-      targets = {}
+      if not (self.add_language_id is False):
+        targets = {'lang_id': numpy.ones(shape=(1,), dtype=numpy.int32) * self.add_language_id}
+      else:
+        targets = {}
       for i in range(self.add_random_phone_seqs):
         assert self.seq_gen  # not implemented atm for orths
         phones = self.seq_gen.generate_garbage_seq(target_len=data.shape[0])
@@ -314,6 +321,7 @@ class LmDataset(CachedDataset2):
           ([self.orth_symbols_map[self.delayed_seq_data_start_symbol]], data[:-1])).astype(self.dtype)
         assert targets["delayed"].shape == data.shape
       self.next_seq_idx = seq_idx + 1
+
       return DatasetSeq(seq_idx=seq_idx, features=data, targets=targets, seq_tag=seq_tag)
 
 
@@ -930,6 +938,7 @@ class TranslationDataset(CachedDataset2):
                unknown_label=None,
                seq_list_file=None,
                use_cache_manager=False,
+               add_language_id=None,
                **kwargs):
     """
     :param str path: the directory containing the files
@@ -946,6 +955,7 @@ class TranslationDataset(CachedDataset2):
     """
 
     super(TranslationDataset, self).__init__(**kwargs)
+    self.add_language_id=add_language_id if add_language_id else {}
     self.path = path
     self.file_postfix = file_postfix
     self.seq_list = [int(n) for n in open(seq_list_file).read().splitlines()] if seq_list_file else None
@@ -968,6 +978,11 @@ class TranslationDataset(CachedDataset2):
     self._data_len = None  # type: int|None
     self._vocabs = {data_key: self._get_vocab(prefix) for (prefix, data_key) in self.MapToDataKeys.items()}
     self.num_outputs = {k: [max(self._vocabs[k].values()) + 1, 1] for k in self._vocabs.keys()}  # all sparse
+    if add_language_id:
+      self._data["source_lang_id"] = []
+      self._data["target_lang_id"] = []
+      self.num_outputs["source_lang_id"] = [2,1]
+      self.num_outputs["target_lang_id"] = [2,1]
     assert all([v1 <= 2 ** 31 for (k, (v1, v2)) in self.num_outputs.items()])  # we use int32
     self.num_inputs = self.num_outputs[self._main_data_key][0]
     self._reversed_vocabs = {k: self._reverse_vocab(k) for k in self._vocabs.keys()}
@@ -1193,8 +1208,14 @@ class TranslationDataset(CachedDataset2):
     line_nr = self._seq_order[seq_idx]
     features = self._get_data(key=self._main_data_key, line_nr=line_nr)
     targets = self._get_data(key=self._main_classes_key, line_nr=line_nr)
-
     assert features is not None and targets is not None
+    if self.add_language_id:
+      features = {'data':features,
+                  'classes':targets,
+                  'source_lang_id': numpy.ones(shape=(1,), dtype=numpy.int32) * self.add_language_id.get("source",0),
+                  'target_lang_id': numpy.ones(shape=(1,), dtype=numpy.int32) * self.add_language_id.get("target",1)}
+      targets = None
+
     return DatasetSeq(
       seq_idx=seq_idx,
       seq_tag=self._tag_prefix + str(line_nr),
