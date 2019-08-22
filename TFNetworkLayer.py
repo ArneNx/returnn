@@ -1112,10 +1112,10 @@ class LayerBase(object):
     data = output
     if isinstance(v, tf.Tensor):
       return v
-    if v is None and data.sparse:
-      raise Exception(
-        ("You must explicitly provide an initial output value for sparse data %r." % data) +
-        (" E.g. '%s': {'initial_output': 'zeros'}." % name))
+    # if v is None and data.sparse:  TODO make this work with two outputs of choice!
+    #   raise Exception(
+    #     ("You must explicitly provide an initial output value for sparse data %r." % data) +
+    #     (" E.g. '%s': {'initial_output': 'zeros'}." % name))
     if v is None:
       v = "zeros"
     bc_shape = [(d if (d is not None) else 1) for d in data.batch_shape]
@@ -2368,7 +2368,8 @@ class SoftmaxOverSpatialLayer(_ConcatInputLayer):
   def get_out_data_from_opts(cls, name, sources, axis=None, **kwargs):
     out = get_concat_sources_data_template(sources, name="%s_output" % name)
     axis = cls._get_axis_to_reduce(out, axis=axis, exception_prefix="%s %r" % (cls.__name__, name))
-    return out.copy_move_axis(axis, -1)
+    out = out.copy_move_axis(axis, -1)
+    return out
 
   @classmethod
   def transform_config_dict(cls, d, network, get_layer):
@@ -2504,7 +2505,7 @@ class ConstantLayer(LayerBase):
   @classmethod
   def get_out_data_from_opts(cls, name, dtype="float32", **kwargs):
     return Data(
-      name="%s_const" % name, shape=(), batch_dim_axis=0, time_dim_axis=None, dtype=dtype)
+      name="%s_const" % name, shape=(), batch_dim_axis=0, time_dim_axis=None, dim=1, dtype=dtype)
 
 
 class GatingLayer(_ConcatInputLayer):
@@ -3103,6 +3104,7 @@ class ExpandDimsLayer(_ConcatInputLayer):
       if this is an integer, the input data is first converted into batch-major mode,
       and then this is counted with batch-dim.
     :param int dim: dimension of new axis (1 by default)
+    :param bool spatial: flag specifying if new axis is spatial axis or not
     """
     super(ExpandDimsLayer, self).__init__(**kwargs)
     data = self.input_data
@@ -3145,7 +3147,7 @@ class ExpandDimsLayer(_ConcatInputLayer):
       raise Exception("invalid axis %r" % axis)
 
   @classmethod
-  def get_out_data_from_opts(cls, name, axis, dim=1, sources=(), **kwargs):
+  def get_out_data_from_opts(cls, name, axis, dim=1, spatial=False, sources=(), **kwargs):
     init_axis = axis
     data = get_concat_sources_data_template(sources)
     data.name = "%s_output" % name
@@ -3160,6 +3162,8 @@ class ExpandDimsLayer(_ConcatInputLayer):
     if isinstance(init_axis, str):
       if init_axis.lower() in ["spatial", "time", "t"] and data.time_dim_axis is None:
         data.time_dim_axis = axis
+    if spatial:
+      data.size_placeholder[axis-1] = tf.ones([data.get_batch_dim()],dtype=tf.int32)
     return data
 
 
@@ -7352,7 +7356,7 @@ class ProbabilisticMaskLayer(LayerBase):
     :param float mask_m_prob: probability that a selected position is replaced by mask token
     :param float mask_r_prob: probability that a selected position is replaced by random token from vocab
     :param LayerBase|None fixed_seq_mask: mask in form of a tensor of seqs length
-    containing 0/1/2/-1 (mask/random/keep/no-mask) for each position
+    containing 0/1/2/3/4/-1 (mask/random/keep/dup/reorder/no-mask) for each position
     :param args:
     :param kwargs:
 
@@ -7417,6 +7421,15 @@ class ProbabilisticMaskLayer(LayerBase):
       self.mask_d_prob = tf.constant(mask_d_prob)
       self.mask_o_prob = tf.constant(mask_o_prob)
 
+    # Making masking deterministic for evaluation
+    if self.network.train_flag is not False:
+      self.mask_m_prob = tf.cond(self.network.train_flag, lambda: self.mask_m_prob, lambda: tf.constant(1.0))
+      self.mask_r_prob = tf.cond(self.network.train_flag, lambda: self.mask_r_prob, lambda: tf.constant(0.0))
+      self.mask_k_prob = tf.cond(self.network.train_flag, lambda: self.mask_k_prob, lambda: tf.constant(0.0))
+      self.mask_d_prob = tf.cond(self.network.train_flag, lambda: self.mask_d_prob, lambda: tf.constant(0.0))
+      self.mask_o_prob = tf.cond(self.network.train_flag, lambda: self.mask_o_prob, lambda: tf.constant(0.0))
+
+
     source_data = self.sources[0].output
 
     self.vocab = self._read_dict(vocab)
@@ -7427,12 +7440,11 @@ class ProbabilisticMaskLayer(LayerBase):
     seqs = source_data.get_placeholder_as_batch_major()
     seq_lengths = source_data.get_sequence_lengths()
     seq_mask = self.sources[1].output.get_placeholder_as_batch_major() if len(self.sources) > 1 else None
-    if use_mask_factor_range:
+    if use_mask_factor_range and self.network.train_flag is not False:
       # if this a tuple -> factor is selected uniformly at random from range [mask_factor[0],mask_factor[1])
       self.mask_factor = tf.cond(self.network.train_flag,
                             lambda: tf.random_uniform([], self.mask_factor, self.mask_factor_upper, seed=self.random_seed),
-                            lambda: self.mask_factor_upper)
-      self.mask_factor = tf.Print(self.mask_factor, [self.mask_factor, self.network.train_flag], "MASK FACTOR")
+                            lambda: (self.mask_factor_upper-self.mask_factor)/2)
     mask_prob = self.mask_prob * self.mask_factor
 
     masked_sequence, labels, positions, num_positions = self._mask_seq(seqs, mask_prob, seq_lengths, seq_mask)
@@ -7686,7 +7698,7 @@ class GeneratePaddingToMatchSeq(LayerBase):
                                                  minval=1.0, maxval=length_factor, dtype=tf.float32), dtype=tf.int32),
                                lambda :tf.cast(tf.cast(lengths_to_match, dtype=tf.float32) * length_factor, dtype=tf.int32))
     else:
-      pad_to_lengths = lengths_to_match * length_factor
+      pad_to_lengths = tf.cast(tf.cast(lengths_to_match, dtype=tf.float32) * length_factor, dtype=tf.int32)
     if max_seq_length is not None:
       pad_to_lengths = tf.minimum(max_seq_length, pad_to_lengths)
     pad_lengths = tf.maximum(pad_to_lengths - lengths_input, tf.constant(1))
