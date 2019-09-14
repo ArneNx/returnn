@@ -683,6 +683,7 @@ class CombinedDataset(CachedDataset2):
                data_map,
                data_dims=None,
                data_dtypes=None,
+               add_language_id=None,
                window=1, **kwargs):
     """
     :param dict[str,dict[str]] datasets: dataset-key -> dataset-kwargs. including keyword 'class' and maybe 'files'
@@ -748,6 +749,19 @@ class CombinedDataset(CachedDataset2):
     self.num_outputs = self.data_dims
 
     self.data_dtypes = {data_key: _select_dtype(data_key, self.data_dims, data_dtypes) for data_key in self.data_keys}
+
+    if add_language_id:
+      self.language_id = {}
+      for ds_key, id_map in add_language_id.items():
+        self.language_id[ds_key] = {}
+        for key, id in id_map.items():
+          self.language_id[ds_key][key] = numpy.ones([1]) * id
+          self.data_dims[key] = [2,1]
+          self.data_dtypes[key] = "int32"
+      self.add_language_id= True
+    else:
+      self.add_language_id = False
+
 
   def init_seq_order(self, epoch=None, seq_list=None):
     assert seq_list is None, "seq_list not supported for %s" % self.__class__
@@ -968,6 +982,12 @@ class CombinedDataset(CachedDataset2):
     seq_tag = dataset.get_tag(dataset_seq_idx)
     features = self._get_data(dataset_key, dataset_seq_idx, "data")
     targets = {target: self._get_data(dataset_key, dataset_seq_idx, target) for target in self.target_list}
+    if self.add_language_id:
+      features = {'data':features}
+      features.update(targets)
+      features.update(self.language_id[dataset_key])
+      targets = None
+
     return DatasetSeq(seq_idx=seq_idx, seq_tag=seq_tag, features=features, targets=targets)
 
   def is_less_than_num_seqs(self, n):

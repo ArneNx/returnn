@@ -954,7 +954,12 @@ class TranslationDataset(CachedDataset2):
     """
 
     super(TranslationDataset, self).__init__(**kwargs)
-    self.add_language_id=add_language_id if add_language_id else {}
+    if add_language_id:
+      self.language_id = {"source": numpy.ones([1]) * add_language_id.get("source", 0),
+                          "target": numpy.ones([1]) * add_language_id.get("target", 1)}
+      self.add_language_id= True
+    else:
+      self.add_language_id = False
     self.path = path
     self.file_postfix = file_postfix
     self.seq_list = [int(n) for n in open(seq_list_file).read().splitlines()] if seq_list_file else None
@@ -977,7 +982,7 @@ class TranslationDataset(CachedDataset2):
     self._data_len = None  # type: int|None
     self._vocabs = {data_key: self._get_vocab(prefix) for (prefix, data_key) in self.MapToDataKeys.items()}
     self.num_outputs = {k: [max(self._vocabs[k].values()) + 1, 1] for k in self._vocabs.keys()}  # all sparse
-    if add_language_id:
+    if self.add_language_id:
       self._data["source_lang_id"] = []
       self._data["target_lang_id"] = []
       self.num_outputs["source_lang_id"] = [2,1]
@@ -1212,8 +1217,8 @@ class TranslationDataset(CachedDataset2):
     if self.add_language_id:
       features = {'data':features,
                   'classes':targets,
-                  'source_lang_id': numpy.ones(shape=(1,), dtype=numpy.int32) * self.add_language_id.get("source",0),
-                  'target_lang_id': numpy.ones(shape=(1,), dtype=numpy.int32) * self.add_language_id.get("target",1)}
+                  'source_lang_id': self.language_id["source"],
+                  'target_lang_id': self.language_id["target"]}
       targets = None
 
     return DatasetSeq(
